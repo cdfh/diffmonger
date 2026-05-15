@@ -3,17 +3,17 @@
 #include <diffmonger/util/Serialisation.hpp>
 #include <diffmonger/util/PasswordBuffer.hpp>
 #include <diffmonger/util/array.hpp>
+#include <diffmonger/util/Uuid.hpp>
 
 #include <sodium/crypto_box.h>
 #include <sodium/crypto_aead_xchacha20poly1305.h>
 #include <sodium/crypto_pwhash.h>
 #include <sodium/randombytes.h>
+#include <sodium/core.h>
 
 #include <array>
-#include <cstdint>
 #include <cstring>
 #include <type_traits>
-#include <algorithm>
 #include <span>
 #include <vector>
 #include <cassert>
@@ -21,172 +21,294 @@
 
 namespace diffmonger {
 
-static auto constexpr version =
-    make_array_cast<uint8_t>(0xee, 0x2c, 0x0c, 0xcd, 0xd0, 0x53, 0x83, 0x8b,
-                             0xe9, 0x97, 0x05, 0xd8, 0xfd, 0x1f, 0xfd, 0x61);
+static Uuid constexpr version{
+    make_array_cast<std::byte>(0xee, 0x2c, 0x0c, 0xcd, 0xd0, 0x53, 0x83, 0x8b,
+                               0xe9, 0x97, 0x05, 0xd8, 0xfd, 0x1f, 0xfd, 0x61)};
 
+
+EncryptionKey::EncryptionKey(PasswordBuffer const &password, KeyPair const &keyPair)
+    : EncryptionKey{password, keyPair.getSalt(), keyPair.getKdfParams()}
+{}
+
+
+EncryptionKey::EncryptionKey(PasswordBuffer const &password,
+                             Salt const &salt,
+                             KdfParams const &kdfParams)
+    : keyNotPassword(size),
+      salt(salt),
+      kdfParams(kdfParams)
+{
+    if (crypto_pwhash(
+            keyNotPassword.getWriteUPointer(),
+            keyNotPassword.getSize(),
+            password.getPointer(), password.getSize(),
+            salt.value.data(),
+            kdfParams.opslimit,
+            kdfParams.memlimit,
+            kdfParams.passwordHashAlgorithm) != 0)
+    {
+        if (errno == EINVAL)
+            throw std::runtime_error("Invalid parameters for password hashing");
+        throw std::runtime_error("Password hashing failed: out of memory");
+    }
+}
+
+EncryptionKey::Salt EncryptionKey::Salt::create()
+{
+    Salt out;
+    randombytes_buf(out.value.data(), out.value.size());
+    return out;
+}
+
+KeyPair::Nonce KeyPair::Nonce::create()
+{
+    Nonce out;
+    randombytes_buf(out.value.data(), out.value.size());
+    return out;
+}
+
+#if 0
 KeyPair KeyPair::deserialise(std::span<std::byte const> const serialised)
 {
-    Deserialiser deserialiser(serialised);
-
-    KeyPair keyPair;
-
     std::remove_cv_t<decltype(version)> version;
+    EncryptionKey::Salt salt;
+    Nonce nonce;
+    KdfParams kdfParams;
+    PubKey pubKey;
+    PrivKeyRepresentation privKeyRepresentation;
 
-    deserialiser
+    Deserialiser{serialised}
         .deserialise(version)
-        .deserialise(keyPair.salt)
-        .deserialise(keyPair.nonce)
-        .deserialise(keyPair.opslimit)
-        .deserialise(keyPair.memlimit)
-        .deserialise(keyPair.pwhash_algorithm)
-        .deserialise(keyPair.pubKey.payload)
-        .deserialise(keyPair.privKeyRepresentation.payload);
+        .deserialise(salt.value)
+        .deserialise(nonce.value)
+        .deserialise(kdfParams.opslimit)
+        .deserialise(kdfParams.memlimit)
+        .deserialise(kdfParams.passwordHashAlgorithm)
+        .deserialise(pubKey.payload)
+        .deserialise(privKeyRepresentation.payload);
 
     if (version != diffmonger::version)
         throw std::runtime_error("Version mismatch");
 
-    return keyPair;
+    return KeyPair{salt, nonce, kdfParams, pubKey, privKeyRepresentation, version};
 }
 
 std::vector<std::byte> KeyPair::serialise() const
 {
     std::vector<std::byte> out;
-    Serialiser serialiser(out);
-    serialiser
-        .serialise(version)
-        .serialise(salt)
-        .serialise(nonce)
-        .serialise(opslimit)
-        .serialise(memlimit)
-        .serialise(pwhash_algorithm)
+    Serialiser(out)
+        .serialise(version.serialised())
+        .serialise(salt.value)
+        .serialise(nonce.value)
+        .serialise(kdfParams.opslimit)
+        .serialise(kdfParams.memlimit)
+        .serialise(kdfParams.passwordHashAlgorithm)
         .serialise(pubKey.payload)
         .serialise(privKeyRepresentation.payload);
     return out;
 }
+#endif
 
-std::vector<std::byte> KeyPair::additional_data() const
+
+std::vector<std::byte> KeyPair::serialise() const
 {
     std::vector<std::byte> out;
-    Serialiser serialiser(out);
-    serialiser
-        .serialise(version)
-        .serialise(salt)
-        .serialise(nonce)
-        .serialise(opslimit)
-        .serialise(memlimit)
-        .serialise(pwhash_algorithm)
-        .serialise(pubKey.payload);
+    serialisation::Serialiser{out}.serialise(*this);
     return out;
 }
 
-DecryptedKeyPair KeyPair::decrypt(PasswordBuffer const &passphrase) const
+
+template <>
+struct serialisation::Codec<KdfParams>
 {
-    return DecryptedKeyPair({ *this }, passphrase);
+    static void serialise(Serialiser &serialiser, KdfParams const &kdfParams)
+    {
+        serialiser
+            .serialise(kdfParams.opslimit)
+            .serialise(kdfParams.memlimit)
+            .serialise(kdfParams.passwordHashAlgorithm);
+    }
+
+    static KdfParams deserialise(Deserialiser &deserialiser)
+    {
+        KdfParams out;
+        deserialiser
+            .deserialise(out.opslimit)
+            .deserialise(out.memlimit)
+            .deserialise(out.passwordHashAlgorithm);
+        return out;
+    }
+};
+
+
+void serialisation::Codec<KeyPair>::serialise(Serialiser &serialiser, KeyPair const &keyPair)
+{
+    serialiser
+        .serialise(version)
+        .serialise(keyPair.salt.value)
+        .serialise(keyPair.nonce.value)
+        .serialise(keyPair.kdfParams)
+        .serialise(keyPair.pubKey.payload)
+        .serialise(keyPair.privKeyRepresentation.payload);
+}
+
+KeyPair serialisation::Codec<KeyPair>::deserialise(Deserialiser &deserialiser)
+{
+    Uuid version;
+    EncryptionKey::Salt salt;
+    KeyPair::Nonce nonce;
+    KdfParams kdfParams;
+    KeyPair::PubKey pubKey;
+    KeyPair::PrivKeyRepresentation privKeyRepresentation;
+
+    deserialiser
+        .deserialise(version)
+        .deserialise(salt.value)
+        .deserialise(nonce.value)
+        .deserialise(kdfParams)
+        .deserialise(pubKey.payload)
+        .deserialise(privKeyRepresentation.payload);
+
+    if (version != diffmonger::version)
+        throw std::runtime_error("Version mismatch");
+
+    return KeyPair{salt, nonce, kdfParams, pubKey, privKeyRepresentation, version};
 }
 
 
-void KeyPair::check() const
+std::vector<std::byte> DecryptedKeyPair::aeadAdditionalData(EncryptionKey::Salt const &salt,
+                                                            KdfParams const &kdfParams,
+                                                            KeyPair::Nonce const &nonce,
+                                                            KeyPair::PubKey const &pubkey,
+                                                            Uuid const &version)
 {
-    if (!((opslimit >= crypto_pwhash_OPSLIMIT_MIN) &&
-          (opslimit <= crypto_pwhash_OPSLIMIT_MAX)))
-        throw std::runtime_error("Invalid opslimit");
-    if (!((memlimit >= crypto_pwhash_MEMLIMIT_MIN) &&
-          (opslimit <= crypto_pwhash_MEMLIMIT_MAX)))
-        throw std::runtime_error("Invalid memlimit");
+    std::vector<std::byte> out;
+    serialisation::Serialiser(out)
+        .serialise(version.serialised())
+        .serialise(salt.value)
+        .serialise(nonce.value)
+        .serialise(kdfParams.opslimit)
+        .serialise(kdfParams.memlimit)
+        .serialise(kdfParams.passwordHashAlgorithm)
+        .serialise(pubkey.payload);
+    return out;
 }
 
-DecryptedKeyPair DecryptedKeyPair::generateFromPassphrase(PasswordBuffer const &passphrase)
+
+DecryptedKeyPair KeyPair::decrypt(EncryptionKey const &encryptionKey) const
 {
-    DecryptedKeyPair out{};
+    return DecryptedKeyPair({ *this }, encryptionKey);
+}
 
-    std::array<unsigned char, crypto_box_PUBLICKEYBYTES> &pubKey = out.keyPair.pubKey.payload;
-    std::array<unsigned char,
-               crypto_box_SECRETKEYBYTES + crypto_aead_xchacha20poly1305_IETF_ABYTES>
-        &privkey = out.keyPair.privKeyRepresentation.payload;
 
-    auto &privkey_plaintext = out.privkey_plaintext;
+KeyPair::KeyPair(EncryptionKey::Salt const &salt,
+                 Nonce const &nonce,
+                 KdfParams const &kdfParams,
+                 PubKey const &pubKey,
+                 PrivKeyRepresentation const &privKeyRepresentation,
+                 Uuid const &version)
+    : salt(salt),
+      nonce(nonce),
+      kdfParams(kdfParams),
+      pubKey(pubKey),
+      privKeyRepresentation(privKeyRepresentation),
+      version(version)
+{
+}
 
-    crypto_box_keypair(pubKey.data(),
-                       reinterpret_cast<unsigned char *>(
-                           privkey_plaintext->getWritePointer()));
+
+DecryptedKeyPair DecryptedKeyPair::generateFromPassphrase(KdfParams const &kdfParams,
+                                                          PasswordBuffer const &password)
+{
+    return generateFromKey(EncryptionKey{password,
+                                         EncryptionKey::Salt::create(),
+                                         kdfParams});
+}
+
+
+DecryptedKeyPair DecryptedKeyPair::generateFromKey(EncryptionKey const &key)
+{
+    if (sodium_init() < 0)
+        throw std::runtime_error("libsodium init failed");
+
+    KeyPair::PubKey pubKey;
+    PrivKeyPlaintext privKeyPlaintext;
+
+    if (crypto_box_keypair(pubKey.payload.data(),
+                           reinterpret_cast<unsigned char *>(
+                               privKeyPlaintext.payload->getWritePointer())) != 0)
+        throw std::runtime_error("Failed to create keypair");
 
     static_assert(crypto_aead_xchacha20poly1305_ietf_KEYBYTES >= crypto_pwhash_BYTES_MIN);
     static_assert(crypto_aead_xchacha20poly1305_ietf_KEYBYTES <= crypto_pwhash_BYTES_MAX);
 
-    PasswordBuffer key(crypto_aead_xchacha20poly1305_ietf_KEYBYTES);
+    auto nonce = KeyPair::Nonce::create();
 
-    std::array<unsigned char, crypto_pwhash_SALTBYTES> &salt = out.keyPair.salt;
+    auto const additional_data =
+        aeadAdditionalData(key.getSalt(), key.getKdfParams(), nonce, pubKey, version);
 
-    randombytes_buf(salt.data(), salt.size());
-
-    if (crypto_pwhash
-        (key.getWriteUPointer(), key.getSize(),
-         passphrase.getPointer(), passphrase.getSize(),
-         salt.data(),
-         out.keyPair.opslimit,
-         out.keyPair.memlimit,
-         out.keyPair.pwhash_algorithm) != 0)
-        throw std::runtime_error("Password hashing failed: out of memory");
-
-    std::array<unsigned char, crypto_aead_xchacha20poly1305_IETF_NPUBBYTES> &nonce =
-        out.keyPair.nonce;
-
-    randombytes_buf(nonce.data(), nonce.size());
-
-    auto const additional_data = out.keyPair.additional_data();
+    KeyPair::PrivKeyRepresentation privkey;
 
     crypto_aead_xchacha20poly1305_ietf_encrypt(
-        privkey.data(),
+        privkey.payload.data(),
         nullptr,
-        privkey_plaintext->getUPointer(),
-        privkey_plaintext->getSize(),
+        privKeyPlaintext.payload->getUPointer(),
+        privKeyPlaintext.payload->getSize(),
         reinterpret_cast<unsigned char const *>(additional_data.data()),
         additional_data.size(),
         nullptr,
-        nonce.data(),
-        key.getUPointer());
+        nonce.value.data(),
+        key.getKeyNotPassword().getUPointer());
 
-    return out;
+    return DecryptedKeyPair{
+        KeyPair{key.getSalt(), nonce, key.getKdfParams(), pubKey, privkey, version},
+        std::move(privKeyPlaintext)};
 }
 
-DecryptedKeyPair::DecryptedKeyPair(KeyPair keyPair, PasswordBuffer const &passphrase)
-    : keyPair(std::move(keyPair))
+
+DecryptedKeyPair::DecryptedKeyPair(KeyPair const &keyPair, PasswordBuffer const &password)
+    : DecryptedKeyPair{keyPair, EncryptionKey{password, keyPair}}
 {
-    PasswordBuffer key(crypto_aead_xchacha20poly1305_ietf_KEYBYTES);
+}
 
-    static_assert(crypto_aead_xchacha20poly1305_ietf_KEYBYTES >= crypto_pwhash_BYTES_MIN);
-    static_assert(crypto_aead_xchacha20poly1305_ietf_KEYBYTES <= crypto_pwhash_BYTES_MAX);
+DecryptedKeyPair::DecryptedKeyPair(KeyPair const &_keyPair,
+                                   EncryptionKey const &encryptionKey)
+    : keyPair(_keyPair)
+{
+    if (sodium_init() < 0)
+        throw std::runtime_error("libsodium init failed");
 
-    std::array<unsigned char, crypto_pwhash_SALTBYTES> &salt = keyPair.salt;
+    static_assert(EncryptionKey::size >= crypto_pwhash_BYTES_MIN);
+    static_assert(EncryptionKey::size <= crypto_pwhash_BYTES_MAX);
 
-    if (crypto_pwhash
-        (key.getWriteUPointer(), key.getSize(), passphrase.getPointer(), passphrase.getSize(),
-         salt.data(),
-         keyPair.opslimit,
-         keyPair.memlimit,
-         keyPair.pwhash_algorithm) != 0)
-        throw std::runtime_error("Password hashing failed: out of memory");
+    static_assert(decltype(keyPair.privKeyRepresentation)::size ==
+                  (decltype(privKeyPlaintext)::size +
+                   crypto_aead_xchacha20poly1305_IETF_ABYTES));
 
-    std::array<unsigned char, crypto_aead_xchacha20poly1305_IETF_NPUBBYTES> &nonce = keyPair.nonce;
-
-    if (keyPair.privKeyRepresentation.payload.size() !=
-        (privkey_plaintext->getSize() + crypto_aead_xchacha20poly1305_IETF_ABYTES))
-        throw std::runtime_error("Unexpected ciphertext length");
-
-    auto const additional_data = keyPair.additional_data();
+    auto const additional_data = aeadAdditionalData(keyPair.salt,
+                                                    keyPair.getKdfParams(),
+                                                    keyPair.nonce,
+                                                    keyPair.pubKey,
+                                                    keyPair.version);
 
     if (crypto_aead_xchacha20poly1305_ietf_decrypt(
-            privkey_plaintext->getWriteUPointer(),
+            privKeyPlaintext.payload->getWriteUPointer(),
             nullptr,
             nullptr,
             keyPair.privKeyRepresentation.payload.data(),
             keyPair.privKeyRepresentation.payload.size(),
             reinterpret_cast<unsigned char const *>(additional_data.data()),
             additional_data.size(),
-            nonce.data(),
-            key.getUPointer()) != 0)
+            keyPair.nonce.value.data(),
+            encryptionKey.getKeyNotPassword().getUPointer()) != 0)
         throw std::runtime_error("Decryption failure");
 }
+
+DecryptedKeyPair::DecryptedKeyPair(KeyPair const &keyPair, PrivKeyPlaintext privKeyPlaintext)
+    : keyPair(keyPair),
+      privKeyPlaintext(std::move(privKeyPlaintext))
+{
+}
+
 
 }

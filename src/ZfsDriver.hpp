@@ -20,7 +20,6 @@ public:
     {
         std::vector<std::string> zfsCommand = { "zfs" };
         std::string datasetName{};
-        bool receive_unmounted = false;
         std::optional<std::vector<std::string>> receive0_args{};
         std::optional<std::vector<std::string>> receiven_args{};
     };

@@ -118,7 +118,7 @@ class Command
         auto const it = map.find(key);
         return
             it == map.end()
-            ? propagate_const_ptr(decltype(it->second){})
+            ? decltype(propagate_const_ptr(it->second)){}
             : propagate_const_ptr(it->second);
     }
 
@@ -139,7 +139,7 @@ class Command
         return parent;
     }
 public:
-    Command(Parent parent, std::string name)
+    Command(Parent const &parent, std::string name)
         : name(std::move(name)), parent(parent.value)
     {
         using namespace parser;

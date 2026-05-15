@@ -15,7 +15,6 @@
 #include <filesystem>
 #include <functional>
 #include <vector>
-#include <map>
 #include <set>
 #include <iterator>
 #include <iostream>
@@ -185,9 +184,10 @@ void store_snapshot(RepositoryStructure &repositoryStructure,
                 // be sent to the reader.
                 driver_to_encryption_pair.write_end.reset();
 
-                encryptToFd(*repositoryStructure.readKeyPair(),
-                            std::move(driver_to_encryption_pair.read_end),
-                            std::move(temporarySnapshot.getFd()));
+                encryptToFd(
+                    repositoryStructure.readKeyPairs(),
+                    std::move(driver_to_encryption_pair.read_end),
+                    std::move(temporarySnapshot.getFd()));
             });
 
         // Important: if this isn't close()ed, then storeSnapshotOrDiff hangs if the child
@@ -263,20 +263,51 @@ void prune(RepositoryStructure const &repositoryStructure,
     }
 }
 
+std::unique_ptr<DecryptedKeyPair>
+decryptKeyPair(RepositoryStructure const &repositoryStructure,
+               PasswordBuffer const &password)
+{
+    std::unique_ptr<DecryptedKeyPair> out;
+    repositoryStructure.withKeyPairs(
+        [&] (KeyPair const &keyPair, size_t const curslot)
+        {
+            try
+            {
+                out = std::make_unique<DecryptedKeyPair>(keyPair, password);
+            } catch (std::runtime_error const &e)
+            {
+                // No need to differentiate wrong password from other errors:
+                // in either case, the correct course of action is to continue to try
+                // other slots.
+                std::cerr <<
+                    "When decrypting slot " << curslot << ": " << e.what() << "\n";
+            }
+            return true;
+        });
+    return out;
+}
+
 } // <-- anonymous namespace
 
 void init_repository(std::filesystem::path const &repository_path,
+                     Uuid const &repositoryStructureFormatUuid,
                      std::vector<std::string> const &initargs)
 {
     auto repositoryStructure =
-        RepositoryStructure::createRepository(repository_path, initargs);
+        RepositoryStructure::createRepository(repository_path, repositoryStructureFormatUuid, initargs);
 }
 
 void init_keypair(std::filesystem::path const &repositoryPath,
                   InitKeyPairParams const &initKeyPairParams)
 {
-    auto decryptedKeyPair = DecryptedKeyPair::generateFromPassphrase(*initKeyPairParams.password);
-    RepositoryStructure::storeKeys(repositoryPath, decryptedKeyPair.getKeyPair());
+    KdfParams params{};
+
+    params.memlimit = initKeyPairParams.memlimit;
+
+    auto const decryptedKeyPair =
+        DecryptedKeyPair::generateFromPassphrase(params,
+                                                 *initKeyPairParams.password);
+    RepositoryStructure::storeKeyPair(repositoryPath, decryptedKeyPair.getKeyPair());
 }
 
 void RepositoryParams::verify() const
@@ -450,10 +481,14 @@ void restore(RepositoryStructure const &repositoryStructure,
              std::function<void(std::unique_ptr<BackendDriver::SnapshotId>)>
              const &uponEachSnapshot = {})
 {
-    std::optional<DecryptedKeyPair> const decryptedKeyPair =
+    std::unique_ptr<DecryptedKeyPair> const decryptedKeyPair =
         repositoryParams.encryption
-        ? repositoryStructure.readKeyPair()->decrypt(*params.password)
-        : std::optional<DecryptedKeyPair>{};
+        ? decryptKeyPair(
+            repositoryStructure,
+            params.password
+            ? *params.password
+            : throw std::runtime_error("Password needed but not given"))
+        : std::unique_ptr<DecryptedKeyPair>{};
 
     auto const decrypted =
         [&] (Node const node, auto const &f)
@@ -464,7 +499,7 @@ void restore(RepositoryStructure const &repositoryStructure,
             {
                 fprintf(stderr, "encryption enabled for repository %s\n",
                         repositoryStructure.getRepository().c_str());
-                withDecryptedInput(std::move(input), decryptedKeyPair.value(), f);
+                withDecryptedInput(std::move(input), *decryptedKeyPair, f);
             } else
             {
                 fprintf(stderr, "no encryption enabled\n");
@@ -642,11 +677,11 @@ ExitStatus export_repository(RepositoryStructure &repositoryStructure,
 }
 
 void show_init(RepositoryStructure const &repositoryStructure,
-               InitCmdParams const &initCmdParams)
+               ShowInitParams const &showInitParams)
 {
     auto const initargs = repositoryStructure.getInitArgs();
 
-    if (initCmdParams.nullsep)
+    if (showInitParams.nullsep)
     {
         for (auto const &initarg: initargs)
             printf("%s%c", initarg.c_str(), '\0');

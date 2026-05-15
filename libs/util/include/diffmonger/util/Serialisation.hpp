@@ -11,19 +11,13 @@
 #include <span>
 #include <vector>
 #include <cassert>
-#include <utility>
+#include <stdexcept>
 
+namespace diffmonger::serialisation
+{
 
-namespace diffmonger {
-
-// Possibly replace with cereal?
-
-// Perhaps prefer cpu_to_le32() from <asm/byteorder.h>, etc?
-// (Or maybe htonl() and friends from <arpa/inet.h>.)
-// Should be implemented with intrinsics...
-// TOOD: Confirm whether the optimiser can optimise these functions away.
 template <typename IntType>
-[[nodiscard]] std::array<std::byte, sizeof(IntType)> serialise(IntType value)
+[[nodiscard]] std::array<std::byte, sizeof(IntType)> to_bytes(IntType value)
 {
     using UnsignedType = std::make_unsigned_t<IntType>;
 
@@ -35,19 +29,19 @@ template <typename IntType>
     alignas(alignof(IntType)) std::array<std::byte, sizeof(IntType)> out;
 
     for (size_t i = 0; i != sizeof(IntType); ++i)
-        out[i] = static_cast<std::byte>(static_cast<uint8_t>(uvalue >> (i*8)));
+        out[i] = static_cast<std::byte>(static_cast<uint8_t>(uvalue >> (i * 8)));
 
     return out;
 }
 
 template <>
-[[nodiscard]] inline std::array<std::byte, 1> serialise(std::byte const value)
+[[nodiscard]] inline std::array<std::byte, 1> to_bytes(std::byte const value)
 {
-    return std::array<std::byte, 1>{ value };
+    return { value };
 }
 
 template <typename IntType>
-[[nodiscard]] IntType deserialise(std::span<std::byte const, sizeof(IntType)> const bytes)
+[[nodiscard]] IntType from_bytes(std::span<std::byte const, sizeof(IntType)> const bytes)
 {
     using UnsignedType = std::make_unsigned_t<IntType>;
 
@@ -63,148 +57,222 @@ template <typename IntType>
 }
 
 template <>
-[[nodiscard]] inline std::byte deserialise(std::span<std::byte const, 1> const bytes)
+[[nodiscard]] inline std::byte from_bytes(std::span<std::byte const, 1> const bytes)
 {
     return bytes[0];
 }
 
-class Serialiser {
+
+class Serialiser;
+class Deserialiser;
+
+template <typename T>
+struct Codec;
+
+class Serialiser
+{
 public:
-    Serialiser(std::vector<std::byte> &buffer) : buffer(buffer) {}
+    explicit Serialiser(std::vector<std::byte> &buffer)
+        : buffer(buffer)
+    {}
 
     template <typename T>
-    requires std::is_integral_v<T>
     Serialiser &serialise(T const &value)
     {
-        auto const bytes = diffmonger::serialise(value);
+        Codec<T>::serialise(*this, value);
+        return *this;
+    }
+
+    void write_bytes(std::span<std::byte const> bytes)
+    {
         buffer.insert(buffer.end(), bytes.begin(), bytes.end());
-        return *this;
     }
 
-    template <typename T, size_t N>
-    Serialiser &serialise(std::array<T, N> const &arr)
-    {
-        return serialise_noprefix(std::span(arr.begin(), arr.end()));
-    }
-
-    template <typename T>
-    Serialiser &serialise(std::span<T const> const xs)
-    {
-        serialise(xs.size());
-        return serialise_noprefix(xs);
-    }
-
-    Serialiser &serialise(std::string_view const str)
-    {
-        return serialise(std::as_bytes(std::span(str)));
-    }
-
-    Serialiser &serialise(std::string const &str)
-    {
-        return serialise(std::as_bytes(std::span(str)));
-    }
-
-    Serialiser &serialise(std::byte const byte)
-    {
-        buffer.push_back(byte);
-        return *this;
-    }
 private:
-    template <typename T>
-    Serialiser &serialise_noprefix(std::span<T const> const xs)
-    {
-        for (auto const &x: xs)
-            serialise(x);
-        return *this;
-    }
-
     std::vector<std::byte> &buffer;
 };
+
 
 class Deserialiser
 {
 public:
-    Deserialiser(std::span<std::byte const> const data)
+    explicit Deserialiser(std::span<std::byte const> data)
         : ptr(data.data()), end(data.data() + data.size())
-    {
-    }
-
-    template <typename T, size_t N>
-    Deserialiser &deserialise(std::array<T, N> &out)
-    {
-        for (auto &x: out)
-            deserialise<T>(x);
-        return *this;
-    }
-
-    template <typename T, size_t N>
-    Deserialiser &deserialise(std::array<std::byte, N> &out)
-    {
-        return deserialise(std::span(out));
-    }
-
-    Deserialiser &deserialise(std::span<std::byte> const xs)
-    {
-        auto const source_ptr = consume(xs.size());
-        memcpy(xs.data(), source_ptr, xs.size());
-        return *this;
-    }
+    {}
 
     template <typename T>
-    Deserialiser &deserialise(std::span<T> const out)
+    T deserialise()
     {
-        for (auto &x: out)
-            deserialise(x);
-        return *this;
-    }
-
-    template <typename T>
-    Deserialiser &deserialise(std::vector<T> &xs)
-    {
-        size_t n;  // <-- Do not trust n, it could have been corrupted.
-        deserialise(n);
-
-        xs = std::vector<T>();
-
-        for (size_t i=0; i != n; ++i)
-        {
-            auto &x = xs.emplace_back();
-            deserialise(x);
-        }
-
-        return *this;
-    }
-
-    Deserialiser &deserialise(std::string &out)
-    {
-        std::vector<std::byte> tmp;
-        deserialise(tmp);
-        out = std::string(reinterpret_cast<char *>(tmp.data()), tmp.size());
-        return *this;
+        return Codec<T>::deserialise(*this);
     }
 
     template <typename T>
     Deserialiser &deserialise(T &out)
     {
-        auto const source_ptr = consume(sizeof(T));
-        out = diffmonger::deserialise<T>(
-            std::span<std::byte const, sizeof(T)>(source_ptr, sizeof(T)));
+        out = deserialise<T>();
         return *this;
     }
-protected:
-    std::byte const *consume(size_t const nbytes)
+
+    std::span<std::byte const> consume(size_t const nbytes)
     {
         assert(end >= ptr);
-        if (size_t(end - ptr) < nbytes)
-            throw std::runtime_error("Could not read type from string: too few bytes "
-                                     "(data corruption?)");
-        return std::exchange(ptr, ptr + nbytes);
+
+        if (static_cast<size_t>(end - ptr) < nbytes)
+            throw std::runtime_error("Insufficient data (corrupt stream)");
+
+        std::byte const *start = ptr;
+        ptr += nbytes;
+
+        return { start, nbytes };
     }
+
 private:
     std::byte const *ptr;
     std::byte const *end;
 };
 
-}
+
+template <typename T>
+struct Codec
+{
+    static void serialise(Serialiser &, T const &)
+    {
+        static_assert(sizeof(T) == 0,
+            "No Codec<T>::serialise defined for this type");
+    }
+
+    static T deserialise(Deserialiser &)
+    {
+        static_assert(sizeof(T) == 0,
+            "No Codec<T>::deserialise defined for this type");
+    }
+};
+
+
+template <std::integral T>
+struct Codec<T>
+{
+    static void serialise(Serialiser &s, T const &value)
+    {
+        auto const bytes = to_bytes(value);
+        s.write_bytes(bytes);
+    }
+
+    static T deserialise(Deserialiser &d)
+    {
+        auto const span = d.consume(sizeof(T));
+
+        return from_bytes<T>(
+            std::span<std::byte const, sizeof(T)>(
+                span.data(), sizeof(T)));
+    }
+};
+
+
+template <>
+struct Codec<std::byte>
+{
+    static void serialise(Serialiser &s, std::byte const &b)
+    {
+        s.write_bytes(std::span{ &b, 1 });
+    }
+
+    static std::byte deserialise(Deserialiser &d)
+    {
+        auto const span = d.consume(1);
+        return span[0];
+    }
+};
+
+
+template <>
+struct Codec<std::string>
+{
+    static void serialise(Serialiser &s, std::string const &str)
+    {
+        // length prefix
+        s.serialise(str.size());
+
+        s.write_bytes(
+            std::as_bytes(std::span(str.data(), str.size())));
+    }
+
+    static std::string deserialise(Deserialiser &d)
+    {
+        size_t n = d.deserialise<size_t>();
+
+        auto bytes = d.consume(n);
+
+        return std::string(
+            reinterpret_cast<char const *>(bytes.data()),
+            bytes.size());
+    }
+};
+
+
+template <typename T>
+struct Codec<std::vector<T>>
+{
+    static void serialise(Serialiser &s, std::vector<T> const &v)
+    {
+        s.serialise(v.size());
+        for (auto const &x: v)
+            s.serialise(x);
+    }
+
+    static std::vector<T> deserialise(Deserialiser &d)
+    {
+        size_t n = d.deserialise<size_t>();
+
+        std::vector<T> v;
+        v.reserve(n);
+
+        for (size_t i = 0; i != n; ++i)
+            v.push_back(d.deserialise<T>());
+
+        return v;
+    }
+};
+
+
+template <typename T, size_t N>
+struct Codec<std::array<T, N>>
+{
+    static void serialise(Serialiser &s, std::array<T, N> const &a)
+    {
+        for (auto const &x: a)
+            s.serialise(x);
+    }
+
+    static std::array<T, N> deserialise(Deserialiser &d)
+    {
+        std::array<T, N> a{};
+
+        for (auto &x : a)
+            x = d.deserialise<T>();
+
+        return a;
+    }
+};
+
+
+template <typename T>
+struct Codec<std::span<T>>
+{
+    static void serialise(Serialiser &s, std::span<T const> sp)
+    {
+        s.serialise(sp.size());
+        for (auto const &x: sp)
+            s.serialise(x);
+    }
+
+    static std::span<T> deserialise(Deserialiser &)
+    {
+        static_assert(sizeof(T) == 0,
+            "Deserialising std::span is not supported (no ownership)");
+    }
+};
+
+} // namespace diffmonger::serialisation
 
 #endif

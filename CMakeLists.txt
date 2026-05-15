@@ -38,9 +38,9 @@ add_library(libdiffmonger STATIC
   src/diffmonger.hpp
   src/EncryptionUtil.cpp
   src/EncryptionUtil.hpp
-  src/Node.hpp
   src/KeyPair.cpp
   src/KeyPair.hpp
+  src/Node.hpp
   src/RepositoryParams.hpp
   src/RepositoryStructure.cpp
   src/RepositoryStructure.hpp
@@ -67,6 +67,11 @@ target_compile_options(diffmonger PRIVATE -Wall -Wextra -Wpedantic -Werror)
 add_executable(node-test test/node.cpp)
 target_link_libraries(node-test PUBLIC libdiffmonger)
 target_compile_options(node-test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
+add_executable(disk-usage-analysis simulation/disk-usage-analysis.cpp)
+target_link_libraries(disk-usage-analysis PUBLIC libdiffmonger)
+target_compile_options(disk-usage-analysis PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
 
 install(TARGETS diffmonger
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

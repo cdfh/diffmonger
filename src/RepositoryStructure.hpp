@@ -13,10 +13,12 @@
 #include <memory>
 #include <optional>
 #include <expected>
+#include <functional>
 
 namespace diffmonger {
 
 class KeyPair;
+
 
 class RepositoryStructure
 {
@@ -78,6 +80,44 @@ public:
         std::unique_ptr<Impl> impl;
     };
 
+#if 0
+    /**
+     * Convenience class as initargs annoyingly needs to be converted
+     * to vector<string_view> for parser.
+     */
+    class InitArgsPair
+    {
+    public:
+        std::vector<std::string> const &getInitArgs();
+        Uuid repositoryStructureFormatUuid;
+        std::vector<std::string> const initargs;
+        std::vector<std::string_view> const initargs_stringview =
+            std::vector<std::string_view>(initargs.begin(), initargs.end());
+
+        std::span<std::string_view const> span_exc_front() const
+        {
+            return { std::next(initargs_stringview.begin()),
+                     initargs_stringview.end() };
+        }
+
+        std::string const &getName() const
+        {
+            return initargs.front();
+        }
+
+        InitArgsPair(Uuid const &repositoryStructureFormatUuid,
+                     std::vector<std::string> initargs)
+            : repositoryStructureFormatUuid{repositoryStructureFormatUuid},
+              initargs{
+                  initargs.empty()
+                  ? throw std::runtime_error("Initargs invalid; corrupted repository?")
+                  : initargs}
+
+        {}
+    };
+#endif
+
+
     std::filesystem::path getPayloadFile(Node const node) const;
 
     BackendDriver::SnapshotId::Encoded getEncodedSnapshotId(Node const node) const;
@@ -85,7 +125,23 @@ public:
     std::optional<BackendDriver::SnapshotId::Encoded>
     tryGetEncodedSnapshotId(Node const node) const;
 
-    std::unique_ptr<KeyPair> readKeyPair() const;
+    /**
+     * Returns a sorted vector of KeyPairs known to the repository.
+     * Note that this should never be used for decryption operations.
+     * This is because returning a vector is sensitive to DoS attacks where
+     * ransomware spams the repository by creating spurious keypairs,
+     * thereby preventing restore operations due to readKeyPairs() always throwing
+     * std::bad_alloc. This doesn't matter for encryption operations because
+     * encrypt operations are never attempts to restore.
+     * For decryption related operatinos, see instead withKeyPairs().
+     */
+    std::vector<std::unique_ptr<KeyPair>> readKeyPairs() const;
+
+    /**
+     * DoS safe alternative to readKeyPairs().
+     */
+    void withKeyPairs(
+        std::function<bool(KeyPair const &, size_t)> const &f) const;
 
     /**
      * Commit the TemporarySnapshot into the repository.
@@ -102,7 +158,12 @@ public:
     void commit(TemporarySnapshot temporarySnapshot,
                 BackendDriver::SnapshotId::Encoded const &);
 
-    std::vector<std::string> getInitArgs() const;
+    /**
+     * Get the repository's initargs.
+     * Guaranteed to be non-empty.
+     */
+    std::vector<std::string> const &getInitArgs() const;
+    Uuid getRepositoryStructureFormatUuid() const;
 
     std::vector<Node> getNodes() const;
     std::optional<Node> getLatestNode() const;
@@ -131,8 +192,8 @@ public:
     // but it's useful for printing debugging messages, etc.
     std::filesystem::path const &getRepository() const;
 
-    static void storeKeys(std::filesystem::path repository_path,
-                          KeyPair const &keyPair);
+    static void storeKeyPair(std::filesystem::path repository_path,
+                             KeyPair const &keyPair);
 
     RepositoryStructure() = delete;
     RepositoryStructure(RepositoryStructure const &);
@@ -141,6 +202,7 @@ public:
     ~RepositoryStructure();
 
     static RepositoryStructure createRepository(std::filesystem::path const &repository_path,
+                                                Uuid const &repositoryStructureFormatUuid,
                                                 std::vector<std::string> const &initargs);
 
 protected:
@@ -151,6 +213,8 @@ protected:
     void foreachNode(F &&f) const;
 private:
     std::filesystem::path repository;
+    Uuid repositoryStructureFormatUuid;
+    std::vector<std::string> initargs;
 };
 
 }

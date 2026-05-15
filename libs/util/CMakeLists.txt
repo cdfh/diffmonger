@@ -7,6 +7,7 @@ add_library(diffmonger-util STATIC
   include/diffmonger/util/array.hpp
   include/diffmonger/util/FdOwner.hpp
   include/diffmonger/util/finally.hpp
+  include/diffmonger/util/ioutil.hpp
   include/diffmonger/util/misc.hpp
   include/diffmonger/util/parser/Parser.hpp
   include/diffmonger/util/PasswordBuffer.hpp
@@ -14,9 +15,9 @@ add_library(diffmonger-util STATIC
   include/diffmonger/util/Serialisation.hpp
   include/diffmonger/util/transform_iterator.hpp
   include/diffmonger/util/Uuid.hpp
-  src/PasswordBuffer.cpp
   src/FdOwner.cpp
   src/ioutil.cpp
+  src/PasswordBuffer.cpp
   src/Uuid.cpp
 )
 

@@ -2,6 +2,7 @@
 #define DIFFMONGER_UTIL_UUID_HPP
 
 #include <diffmonger/util/array.hpp>
+#include <diffmonger/util/Serialisation.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -11,6 +12,11 @@
 
 namespace diffmonger {
 
+class Uuid;
+
+template <>
+struct serialisation::Codec<Uuid>;
+
 class Uuid
 {
 public:
@@ -18,10 +24,10 @@ public:
 
     using array_type = std::array<std::byte, size>;
 
-    Uuid() = default;
-    Uuid(Uuid const &) = default;
+    constexpr Uuid() = default;
+    constexpr Uuid(Uuid const &) = default;
     Uuid(Uuid &&) = default;
-    Uuid &operator=(Uuid const &) = default;
+    constexpr Uuid &operator=(Uuid const &) = default;
     Uuid &operator=(Uuid &&) = default;
 
     auto operator<=>(Uuid const &) const = default;
@@ -53,8 +59,27 @@ public:
      */
     static Uuid random();
 
+    friend serialisation::Codec<Uuid>;
+
 private:
     array_type bytes;
+};
+
+
+template <>
+struct serialisation::Codec<Uuid>
+{
+    static void serialise(Serialiser &serialiser, Uuid const &uuid)
+    {
+        serialiser.serialise(uuid.bytes);
+    }
+
+    static Uuid deserialise(Deserialiser &deserialiser)
+    {
+        Uuid out;
+        deserialiser.deserialise(out.bytes);
+        return out;
+    }
 };
 
 }

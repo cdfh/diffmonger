@@ -15,46 +15,83 @@
 #include <cstdio>
 #include <utility>
 #include <algorithm>
-#include <map>
 #include <sys/stat.h>
+#include <charconv>
+
 #include <fcntl.h>
 #include <unistd.h>
-
-#include <iostream>
-#include <fstream>
-#include <iomanip>
-#include <charconv>
 
 namespace diffmonger {
 
 namespace {
-static std::filesystem::path snapshotsDirName() { return "snapshots"; }
-static std::filesystem::path temporarySnapshotDirName() { return "temporary-snapshot"; }
-static std::filesystem::path payloadFileName() { return "blob"; }
-static std::filesystem::path idFileName() { return "id"; }
-static std::filesystem::path initArgsFileName() { return "initargs"; }
-static std::filesystem::path keysDirName() { return "keys"; }
-static std::filesystem::path userDataDirName() { return "user-data"; }
-static std::filesystem::path repositoryVersionFileName() { return "repository-version"; }
-static std::filesystem::path uuidFileName() { return "repository-uuid"; }
-static std::string_view repositoryVersion() { return "fb95347a-5159-4e50-8c63-8757a96550e4"; }
+inline std::filesystem::path snapshotsDirName() { return "snapshots"; }
+inline std::filesystem::path temporarySnapshotDirName() { return "temporary-snapshot"; }
+inline std::filesystem::path payloadFileName() { return "blob"; }
+inline std::filesystem::path idFileName() { return "id"; }
+inline std::filesystem::path initArgsFileName() { return "initargs"; }
+inline std::filesystem::path keysDirName() { return "keys"; }
+inline std::filesystem::path userDataDirName() { return "user-data"; }
+#if 0
+inline std::filesystem::path repositoryVersionFileName() { return "repository-version"; }
+inline std::string_view repositoryVersion() { return "fb95347a-5159-4e50-8c63-8757a96550e4"; }
+#endif
+inline std::filesystem::path uuidFileName() { return "repository-uuid"; }
 
-std::filesystem::path getKeyFile(std::filesystem::path const &repository,
-                                 bool create_new = false)
+static constexpr size_t maxKeySlots = 255;
+
+
+// Returns the number of keyFiles present.
+template <typename F>
+void withKeyFiles(std::filesystem::path const &repository, F &&f)
 {
     auto const dir = repository/keysDirName();
+
     if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir))
         throw std::runtime_error("Invalid keys directory for repository");
-    struct Candidate
+
+    /*
+     * The logic here is unexpected but intentional.
+     * We cannot do a regular traversal of the directory because an attacker
+     * may have made the directory infinitely populated in effort to hinder recovery.
+     * Thus, we iterate on a counter instead.
+     */
+
+    size_t n = 0;
+    for (auto const &ignored: std::filesystem::directory_iterator(dir))
     {
-        Candidate(std::filesystem::path const &path) : path(path)
+        ++n;
+        (void) ignored;
+    }
+
+    size_t const counter_end = std::min(n, maxKeySlots + 1);
+    for (size_t counter = 0; counter != counter_end; ++counter)
+    {
+        auto const filename = dir/std::to_string(counter);
+        if (std::filesystem::exists(filename))
+        {
+            if (f(filename, counter))
+                return;
+        }
+    }
+
+    if (n > maxKeySlots)
+        throw std::runtime_error("Too many keyslots");
+}
+
+
+std::vector<std::pair<std::filesystem::path, size_t>>
+getKeyFiles(std::filesystem::path const &repository)
+{
+    struct Entry
+    {
+        Entry(std::filesystem::path const &path) : path(path)
         {
             auto const &filename = this->path.filename();
             auto const &str = filename.native();
             if (std::from_chars(str.data(), str.data() + str.size(), n).ec != std::errc{})
                 throw std::runtime_error("Could not interpret filename as a key: " + str);
         }
-        bool operator<(Candidate const &other) const
+        bool operator<(Entry const &other) const
         {
             return n < other.n;
         }
@@ -62,27 +99,24 @@ std::filesystem::path getKeyFile(std::filesystem::path const &repository,
         size_t n;
     };
 
-    std::vector<Candidate> candidates;
-    for (auto const &file: std::filesystem::directory_iterator(dir))
-        candidates.emplace_back(file.path());
+    std::vector<Entry> entries;
 
-    auto const it = std::max_element(candidates.begin(),
-                                     candidates.end());
+    withKeyFiles(
+        repository,
+        [&] (std::filesystem::path const &path, size_t)
+        {
+            entries.push_back(path);
+            return false;
+        });
 
-    if (create_new)
-    {
-        if (it == candidates.end())
-            return repository/keysDirName()/"0";
-        else
-            return repository/keysDirName()/std::to_string(it->n + 1);
-    } else
-    {
-        if (it == candidates.end())
-            throw std::runtime_error("No keys in repository");
-        return it->path;
-    }
+    std::sort(entries.begin(), entries.end());
+
+    std::vector<std::pair<std::filesystem::path, size_t>> out;
+    for (auto const &entry: entries)
+        out.emplace_back(entry.path, entry.n);
+
+    return out;
 }
-
 
 }
 
@@ -203,14 +237,33 @@ RepositoryStructure::getEncodedSnapshotId(Node const node) const
         throw out.error();
 }
 
-std::unique_ptr<KeyPair> RepositoryStructure::readKeyPair() const
+void RepositoryStructure::withKeyPairs(
+    std::function<bool(KeyPair const &, size_t)> const &f) const
 {
-    auto const keyFile = getKeyFile(repository);
-    auto const buf =
-        ioutil::read(FdOwner::from_syscall(open(keyFile.c_str(), O_RDONLY),
-                                           "Could not open keyfile",
-                                           keyFile.native()));
-    return std::make_unique<KeyPair>(KeyPair::deserialise(buf));
+    withKeyFiles(
+        repository,
+        [&] (std::filesystem::path const &path, size_t const slot)
+        {
+            auto const buf =
+                ioutil::read(FdOwner::from_syscall(open(path.c_str(), O_RDONLY),
+                                                   "Could not open keyfile",
+                                                   path.native()));
+            return f(serialisation::Deserialiser{buf}.deserialise<KeyPair>(), slot);
+        });
+}
+
+std::vector<std::unique_ptr<KeyPair>> RepositoryStructure::readKeyPairs() const
+{
+    std::vector<std::unique_ptr<KeyPair>> out;
+
+    withKeyPairs(
+        [&] (KeyPair const &keyPair, size_t)
+        {
+            out.emplace_back(std::make_unique<KeyPair>(keyPair));
+            return false;
+        });
+
+    return out;
 }
 
 void RepositoryStructure::commit(TemporarySnapshot temporarySnapshot,
@@ -219,15 +272,6 @@ void RepositoryStructure::commit(TemporarySnapshot temporarySnapshot,
     if (temporarySnapshot.impl->repository != repository)
         throw std::logic_error("Invalid TemporarySnapshot: repository mismatch");
     temporarySnapshot.commit(pathForNode(encoded.node), encoded);
-}
-
-std::vector<std::string> RepositoryStructure::getInitArgs() const
-{
-    auto const data = ioutil::readfile(repository / initArgsFileName());
-    Deserialiser deserialiser(data);
-    std::vector<std::string> out;
-    deserialiser.deserialise(out);
-    return out;
 }
 
 // Function called in unspecified order.
@@ -248,6 +292,18 @@ void RepositoryStructure::foreachNode(F &&f) const
                                  [] (char c) { return std::isdigit(c); }))
             f(Node{std::stoull(filename_str)});
     }
+}
+
+
+std::vector<std::string> const &RepositoryStructure::getInitArgs() const
+{
+    return initargs;
+}
+
+
+Uuid RepositoryStructure::getRepositoryStructureFormatUuid() const
+{
+    return repositoryStructureFormatUuid;
 }
 
 std::vector<Node> RepositoryStructure::getNodes() const
@@ -294,8 +350,12 @@ RepositoryStructure::TemporarySnapshot RepositoryStructure::createTemporarySnaps
 
 RepositoryStructure RepositoryStructure::createRepository(
     std::filesystem::path const &repository_path,
+    Uuid const &repositoryStructureFormatUuid,
     std::vector<std::string> const &initargs)
 {
+    if (initargs.empty())
+        throw std::invalid_argument("Invalid initargs (empty)");
+
     if (std::filesystem::exists(repository_path) &&
         !std::filesystem::is_empty(repository_path))
         throw std::runtime_error("Repository already exists");
@@ -310,15 +370,18 @@ RepositoryStructure RepositoryStructure::createRepository(
                       S_IRUSR | S_IWUSR,
                       true);
 
+#if 0
     ioutil::writefile(repository_path/repositoryVersionFileName(),
                       std::as_bytes(std::span(repositoryVersion())),
                       S_IRUSR | S_IWUSR,
                       true);
+#endif
 
     {
         std::vector<std::byte> buffer;
-        Serialiser serialiser(buffer);
-        serialiser.serialise(std::span(initargs));
+        serialisation::Serialiser{buffer}
+            .serialise(repositoryStructureFormatUuid)
+            .serialise(std::span(initargs));
         ioutil::writefile(repository_path/initArgsFileName(),
                           buffer,
                           S_IRUSR | S_IWUSR,
@@ -344,10 +407,15 @@ Uuid RepositoryStructure::getRepositoryUuid() const
 
 std::filesystem::path const &RepositoryStructure::getRepository() const { return repository; }
 
-void RepositoryStructure::storeKeys(std::filesystem::path repository_path,
-                                    KeyPair const &keyPair)
+void RepositoryStructure::storeKeyPair(std::filesystem::path repository_path,
+                                       KeyPair const &keyPair)
 {
-    auto const path = getKeyFile(repository_path, true);;
+    auto const paths = getKeyFiles(repository_path);
+
+    size_t slot = paths.empty() ? 0 : paths.back().second + 1;
+
+    auto const path = repository_path/keysDirName()/std::to_string(slot);
+
     auto fd = FdOwner::from_syscall(open(path.c_str(),
                                          O_CREAT|O_WRONLY|O_CLOEXEC|O_EXCL,
                                          S_IRUSR|S_IWUSR),
@@ -365,6 +433,7 @@ RepositoryStructure::RepositoryStructure(RepositoryStructure const &other)
 RepositoryStructure::RepositoryStructure(std::filesystem::path const &repository)
     : repository(repository)
 {
+#if 0
     auto const thisRepositoryVersion =
         ioutil::readfile(repository/repositoryVersionFileName());
     if (!equal(std::as_bytes(std::span(thisRepositoryVersion)),
@@ -374,6 +443,14 @@ RepositoryStructure::RepositoryStructure(std::filesystem::path const &repository
             .append(std::string_view(
                         reinterpret_cast<char const *>(thisRepositoryVersion.data()),
                         thisRepositoryVersion.size())));
+#endif
+    auto const data = ioutil::readfile(repository / initArgsFileName());
+    serialisation::Deserialiser{data}
+        .deserialise(repositoryStructureFormatUuid)
+        .deserialise(initargs);
+
+    if (initargs.empty())
+        throw std::runtime_error("Repository initargs were non-valid (empty)");
 }
 
 RepositoryStructure::~RepositoryStructure() {}

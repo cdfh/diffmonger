@@ -46,7 +46,7 @@ T *propagate_const_ptr(std::unique_ptr<T> &x) { return x.get(); }
 template <typename T>
 T const *propagate_const_ptr(std::unique_ptr<T> const &x) { return x.get(); }
 template <typename T>
-T *propagate_const_ptr(std::unique_ptr<T> &&x) { assert(!x); return nullptr; }
+T *propagate_const_ptr(std::unique_ptr<T> &&x) { static_assert(false); }
 
 
 template <typename ...Args>

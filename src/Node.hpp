@@ -23,9 +23,9 @@ struct Node {
      * the root to the given node in decreasing order.
      */
     template <typename F>
-    void fenwick_path(F &&f) const
+    void fenwick_path_exc_root_exc_root(F &&f) const
     {
-        diffmonger::fenwick_path(
+        diffmonger::fenwick_path_exc_root(
             value,
             [&f] (size_t const node) { f(Node{node}); });
     }

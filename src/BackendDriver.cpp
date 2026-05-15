@@ -7,7 +7,7 @@ namespace diffmonger {
 std::vector<std::byte> BackendDriver::SnapshotId::Encoded::serialise() const
 {
     std::vector<std::byte> out;
-    Serialiser{out}
+    serialisation::Serialiser{out}
         .serialise(std::span(bytes))
         .serialise(node.value)
         .serialise(timestamp.time_since_epoch().count());
@@ -22,7 +22,7 @@ BackendDriver::SnapshotId::Encoded::deserialise(std::span<std::byte const> const
     Node node;
     timestamp_t::rep dur;
 
-    Deserialiser{bytes}
+    serialisation::Deserialiser{bytes}
         .deserialise(encoded_bytes)
         .deserialise(node.value)
         .deserialise(dur);

@@ -24,9 +24,9 @@ namespace {
 static Uuid driverIdentityAndVersion()
 {
     return Uuid{
-        std::to_array<uint8_t>(
-            {0xe3,0x7c,0xfb,0xbe,0x35,0x16,0xaf,0x29,
-             0xf4,0x26,0x7e,0xc1,0xdf,0x50,0xc1,0x61})};
+        make_array_cast<std::byte>(
+            0xe3,0x7c,0xfb,0xbe,0x35,0x16,0xaf,0x29,
+            0xf4,0x26,0x7e,0xc1,0xdf,0x50,0xc1,0x61)};
 }
 
 struct SnapshotIdImpl final : public BackendDriver::SnapshotId
@@ -57,11 +57,10 @@ struct SnapshotIdImpl final : public BackendDriver::SnapshotId
     {
         std::vector<std::byte> bytes;
 
-        Serialiser serialiser(bytes);
-
-        serialiser.serialise(driverIdentityAndVersion().serialised());
-        serialiser.serialise(guid.str());
-        serialiser.serialise(name.str());
+        serialisation::Serialiser{bytes}
+            .serialise(driverIdentityAndVersion().serialised())
+            .serialise(guid.str())
+            .serialise(name.str());
 
         return Encoded { .bytes = std::move(bytes),
                          .node = node,
@@ -86,15 +85,14 @@ struct SnapshotIdImpl final : public BackendDriver::SnapshotId
     static std::unique_ptr<SnapshotIdImpl>
     parseNoVerify(Encoded const &encoded)
     {
-        Deserialiser deserialiser(encoded.bytes);
-
         Uuid::array_type driverIdentityAndVersionValue;
         std::string guid;
         std::string name;
 
-        deserialiser.deserialise(driverIdentityAndVersionValue);
-        deserialiser.deserialise(guid);
-        deserialiser.deserialise(name);
+        serialisation::Deserialiser{encoded.bytes}
+            .deserialise(driverIdentityAndVersionValue)
+            .deserialise(guid)
+            .deserialise(name);
 
         if (Uuid{driverIdentityAndVersionValue} != driverIdentityAndVersion())
             throw std::runtime_error(
@@ -268,7 +266,6 @@ public:
     ZfsBackendDriverImpl(DriverArguments args)
         : zfsCommand(std::move(args.zfsCommand)),
           dataset{std::move(args.datasetName)},
-          receive_unmounted{args.receive_unmounted},
           receive0_args(std::move(args.receive0_args)),
           receiven_args(std::move(args.receiven_args))
     {}
@@ -279,7 +276,6 @@ protected:
 private:
     Command zfsCommand;
     zfs::DatasetName dataset;
-    bool receive_unmounted;
     std::optional<std::vector<std::string>> receive0_args;
     std::optional<std::vector<std::string>> receiven_args;
 };

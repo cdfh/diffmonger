@@ -94,6 +94,13 @@ void run(size_t const n)
         }
 
         {
+            // The parent of the next node must always be in the current fenwick path.
+            WasSeen wasInPath{cur.next().fenwick_parent()};
+            cur.fenwick_path_inc_root(wasInPath);
+            fassert(wasInPath, "wasInPath");
+        }
+
+        {
             auto const [it, b] = aliveset.emplace(cur.value);
             fassert(b, "Already in set");
             cur.prune(
@@ -116,21 +123,41 @@ void run(size_t const n)
                 fassert(aliveset.contains(Node{node}.fenwick_parent().value),
                         "Set does not contain parent");
         }
+
+        {
+            Node prev = cur; // <-- Monotonically decreases.
+            cur.alive_after(
+                [&] (Node const alive)
+                {
+                    if (alive == cur)
+                        return;
+
+                    /* The nodes that are unreachable (i.e., because they're not alive).
+                     * Note: this is -1 as we're counting the number of /skipped/ integers
+                     * in a consecutive sequence.
+                     */
+                    auto const unreachable_gap_width = prev.value - alive.value - 1;
+                    auto const d = cur.value - alive.value;
+                    fassert((alive.value < prev.value), "alive < prev");
+                    fassert(2*unreachable_gap_width <= d, "gap width");
+                    prev = alive;
+                });
+        }
     }
 }
 
 int main(int argc, char *argv[])
 {
-  if (argc != 2)
-  {
-    fprintf(stderr,
-            "Call as: %s N\n", argv[0]);
-    exit(1);
-  }
+    if (argc != 2)
+    {
+        fprintf(stderr,
+                "Call as: %s N\n", argv[0]);
+        exit(1);
+    }
 
-  size_t const n = atoi(argv[1]);
+    size_t const n = atoi(argv[1]);
 
-  run(n);
+    run(n);
 
-  return 0;
+    return 0;
 }

@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <span>
 #include <array>
+#include <limits>
 
 namespace diffmonger {
 
@@ -36,7 +37,10 @@ static constexpr size_t plaintextChunkSize = 8192;
 static constexpr size_t ciphertextMaxChunkSize =
     plaintextChunkSize + crypto_secretstream_xchacha20poly1305_ABYTES;
 
-void encryptToFd(KeyPair const &keyPair, FdOwner fromfd, FdOwner tofd)
+static_assert(ciphertextMaxChunkSize <= std::numeric_limits<NbytesT>::max());
+
+void encryptToFd(std::span<std::unique_ptr<KeyPair> const> const keyPairs,
+                 FdOwner fromfd, FdOwner tofd)
 {
     if (sodium_init() < 0)
         throw std::runtime_error("libsodium init failed");
@@ -48,22 +52,36 @@ void encryptToFd(KeyPair const &keyPair, FdOwner fromfd, FdOwner tofd)
     // Init secret stream
     crypto_secretstream_xchacha20poly1305_state state{};
 
-    // Encrypt the symmetric key with the recipient's public key
+    // Encrypt the symmetric key with the recipient's public key and output encrypted key.
+    for (auto const &keyPair: keyPairs)
     {
         std::array<unsigned char,
                    crypto_box_SEALBYTES + crypto_aead_xchacha20poly1305_IETF_KEYBYTES>
             encryptedSymKey;
 
         if (crypto_box_seal(encryptedSymKey.data(), symKey.getUPointer(), symKey.getSize(),
-                            keyPair.getPubKey().data()) != 0)
+                            keyPair->getPubKey().data()) != 0)
             throw std::runtime_error("Failed to encrypt symmetric key");
 
+        bool const is_last = keyPair == keyPairs.back();
+
+        auto const &keyId = keyPair->getKeyId();
+        // Using raw byte serialisation rather than the normal serialisation API so that the output
+        // length is known at compile time---this is beneficial during the decryption phase.
+        std::vector<unsigned char> out;
+        out.insert(out.end(), keyId.begin(), keyId.end());
+        out.insert(out.end(), encryptedSymKey.begin(), encryptedSymKey.end());
+        out.push_back(is_last);
+
+        ioutil::write(tofd, std::as_bytes(std::span(out)));
+    }
+
+    // Output encryption header to begin encryption.
+    {
         std::array<unsigned char, crypto_secretstream_xchacha20poly1305_HEADERBYTES> header{};
         if (crypto_secretstream_xchacha20poly1305_init_push(
                 &state, header.data(), symKey.getUPointer()) != 0)
             throw std::runtime_error("Failed to init secret stream");
-
-        ioutil::write(tofd, std::as_bytes(std::span(encryptedSymKey)));
         ioutil::write(tofd, std::as_bytes(std::span(header.begin(), header.end())));
     }
 
@@ -75,13 +93,16 @@ void encryptToFd(KeyPair const &keyPair, FdOwner fromfd, FdOwner tofd)
         std::move(fromfd), buffer_in,
         [&] (std::span<std::byte const> const buffer)
         {
+            // While nbytes will normally be constant (except for the last message),
+            // the sodium API doesn't make this well defined,
+            // and so we cannot make any assumptions.
             unsigned long long nbytes = 0;
             crypto_secretstream_xchacha20poly1305_push(
                 &state, buffer_out.data(), &nbytes,
                 reinterpret_cast<unsigned char const *>(buffer.data()), buffer.size(),
                 nullptr, 0, 0);
 
-            ioutil::write(tofd, serialise(static_cast<NbytesT>(nbytes)));
+            ioutil::write(tofd, serialisation::to_bytes(static_cast<NbytesT>(nbytes)));
             ioutil::write(tofd, std::as_bytes(std::span(buffer_out.data(), nbytes)));
         });
 
@@ -90,13 +111,13 @@ void encryptToFd(KeyPair const &keyPair, FdOwner fromfd, FdOwner tofd)
         crypto_secretstream_xchacha20poly1305_push(
             &state, buffer_out.data(), &nbytes, nullptr, 0, nullptr, 0,
             crypto_secretstream_xchacha20poly1305_TAG_FINAL);
-        ioutil::write(tofd, serialise(static_cast<NbytesT>(nbytes)));
+        ioutil::write(tofd, serialisation::to_bytes(static_cast<NbytesT>(nbytes)));
         ioutil::write(tofd, std::as_bytes(std::span(buffer_out.data(), nbytes)));
     }
 }
 
-
-void decryptFromFd(DecryptedKeyPair const &decryptedKeyPair, FdOwner fromfd, FdOwner tofd)
+void decryptFromFd(DecryptedKeyPair const &decryptedKeyPair,
+                   FdOwner fromfd, FdOwner tofd)
 {
     if (sodium_init() < 0)
         throw std::runtime_error("libsodium init failed");
@@ -104,21 +125,42 @@ void decryptFromFd(DecryptedKeyPair const &decryptedKeyPair, FdOwner fromfd, FdO
     PasswordBuffer symKey(crypto_aead_xchacha20poly1305_IETF_KEYBYTES);
 
     // Decrypt the session key to symKey
+    bool key_found = false;
+    for (bool is_last = false; !is_last; )
     {
         std::array<unsigned char,
                    crypto_box_SEALBYTES + crypto_aead_xchacha20poly1305_IETF_KEYBYTES>
             encryptedSymKey;
 
-        ioutil::readBytesExact(fromfd, std::as_writable_bytes(std::span(encryptedSymKey)));
+        KeyPair::KeyIdType keyId;
 
-        if (crypto_box_seal_open(symKey.getWriteUPointer(),
-                                 encryptedSymKey.data(),
-                                 encryptedSymKey.size(),
-                                 decryptedKeyPair.getKeyPair().getPubKey().data(),
-                                 decryptedKeyPair.getPrivateKeyPlaintext().getUPointer())
-            != 0)
-            throw std::runtime_error("Error decrypting session key");
+        std::vector<unsigned char>
+            entry(keyId.size() + encryptedSymKey.size() + sizeof(is_last));
+
+        ioutil::readBytesExact(fromfd, std::as_writable_bytes(std::span(entry)));
+
+        memcpy(keyId.data(), entry.data(), keyId.size());
+        memcpy(encryptedSymKey.data(), entry.data() + keyId.size(), encryptedSymKey.size());
+        memcpy(&is_last,
+               entry.data() + keyId.size() + encryptedSymKey.size(),
+               sizeof(is_last));
+
+        if (keyId == decryptedKeyPair.getKeyPair().getKeyId())
+        {
+            key_found = true;
+
+            if (crypto_box_seal_open(symKey.getWriteUPointer(),
+                                     encryptedSymKey.data(),
+                                     encryptedSymKey.size(),
+                                     decryptedKeyPair.getKeyPair().getPubKey().data(),
+                                     decryptedKeyPair.getPrivateKeyPlaintext().getUPointer())
+                != 0)
+                throw std::runtime_error("Error decrypting session key");
+        }
     }
+
+    if (!key_found)
+        throw std::runtime_error("Decryption key not present in any key slot");
 
     crypto_secretstream_xchacha20poly1305_state state{};
 
@@ -142,7 +184,7 @@ void decryptFromFd(DecryptedKeyPair const &decryptedKeyPair, FdOwner fromfd, FdO
         std::array<std::byte, sizeof(NbytesT)> nbytesbuf;
         ioutil::readBytesExact(fromfd, std::span(nbytesbuf));
         auto const nbytes = std::min(ciphertextMaxChunkSize,
-                                     size_t(deserialise<NbytesT>(nbytesbuf)));
+                                     size_t(serialisation::from_bytes<NbytesT>(nbytesbuf)));
         std::span const buf(buffer_in.data(), nbytes);
         ioutil::readBytesExact(fromfd, std::as_writable_bytes(buf));
 

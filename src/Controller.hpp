@@ -55,7 +55,7 @@ struct SnapshotImportParams
 struct RestoreParams
 {
     std::shared_ptr<PasswordBuffer> password;
-    std::optional<Node> node{};
+    std::optional<Node> node;
     /**
      * Should nodes whose snapshots already exist in the live dataset be skipped?
      */
@@ -68,7 +68,7 @@ struct ExportParams
     std::vector<std::string> importCommand;
 };
 
-struct InitCmdParams
+struct ShowInitParams
 {
     // Output as null-separated values?
     bool nullsep = false;
@@ -76,7 +76,8 @@ struct InitCmdParams
 
 struct InitKeyPairParams
 {
-    std::shared_ptr<PasswordBuffer> password;
+    std::unique_ptr<PasswordBuffer> password;
+    size_t memlimit;
 };
 
 struct ListNodesParams
@@ -85,13 +86,14 @@ struct ListNodesParams
 };
 
 void init_repository(std::filesystem::path const &repositoryPath,
+                     Uuid const &repositoryStructureFormatUuid,
                      std::vector<std::string> const &initargs);
 
 void init_keypair(std::filesystem::path const &repositoryPath,
                   InitKeyPairParams const &initKeyPairParams);
 
 void show_init(RepositoryStructure const &repositoryStructure,
-              InitCmdParams const &initCmdParams);
+              ShowInitParams const &initCmdParams);
 
 void snapshot(RepositoryStructure &repositoryStructure,
               RepositoryParams const &repositoryParams,

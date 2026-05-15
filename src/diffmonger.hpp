@@ -11,7 +11,7 @@ namespace diffmonger {
  * the root to the given node in decreasing order.
  */
 template <typename F>
-void fenwick_path(uint64_t node, F &&f)
+void fenwick_path_exc_root(uint64_t node, F &&f)
 {
     for (; node; node -= node & -node)
         f(node);
@@ -20,7 +20,7 @@ void fenwick_path(uint64_t node, F &&f)
 template <typename F>
 void fenwick_path_inc_root(uint64_t const node, F &&f)
 {
-    fenwick_path(node, f);
+    fenwick_path_exc_root(node, f);
     f(0);
 }
 
@@ -38,6 +38,10 @@ inline uint64_t fenwick_parent(uint64_t const node)
  * creation of the given node.
  * The function is called in order, with the node value monotonically decreasing
  * from the given node, down to the 0 node.
+ *
+ * The nodes that will be enumerated are those of the alive set,
+ *
+ * $$A_n = \left\{k \leq n \: | \: k + 3 \operatorname{LSB}(k) \: > \: n\right\}.$$
  */
 template <typename F>
 void alive_after(uint64_t const node, F &&falive)
@@ -110,12 +114,12 @@ void alive_after(uint64_t const node, F &&falive)
         // and the tested condition is no longer stricter than the condition
         // necessary to complete the proof.
         //
-        // The complexity arrises from the fact that at any point in time,
-        // there are two fenwick paths active: the primary path
-        // (i.e., as fenwick_path() would report)
-        // and a secondary, "ghost", path that is kept for redundancy and so
-        // that there is always an option of rolling-back to a recent restore point.
-        // From time to time, the two paths overlap, hence the need for the stricter
+        // The complexity arises from the fact that at any point in time,
+        // there is more than one fenwick path active:
+        // the primary path (i.e., as fenwick_path() would report),
+        // and one or more secondary paths that are kept for redundancy and so
+        // that there is always an option of rolling-back to a recent restoration point.
+        // From time to time, the paths overlap, hence the need for the stricter
         // condition to eliminate the overlap.
 
         assert(node >= cur);
@@ -190,6 +194,33 @@ inline uint64_t time_of_demise(uint64_t const node)
     //
     // Every node lasts exactly 1.5 times the distance to its
     // next natural power-of-two neighbour.
+    //
+    // Regarding the distribution of T(node):
+    //
+    // Let T(node) = time_of_demise(node) = node + 3*(node & -node)
+    //                                    = node + 3*LSB(node)
+    //                                    = node + h(node),
+    //
+    // Corollary 1:
+    // LSB(n) = 2^k if and only if n mod 2^(k + 1) = 2^k.
+    //
+    // Theorem 1:
+    // If N is a random variable uniformly distributed over
+    // {0, 1, ..., 2^d - 1}, where d >= k + 1, then
+    //   Pr(LSB(N) = 2^k) = 2^-(k + 1).
+    //
+    // Proof:
+    // By Corollary 1,
+    //   Pr(LSB(N) = 2^k) = Pr(N mod 2^(k + 1) = 2^k).
+    // Since N is uniformly distributed over {0, 1, ..., 2^d - 1},
+    // the random variable N mod 2^(k + 1) is uniformly distributed over
+    // {0, 1, ..., 2^(k + 1) - 1}.
+    // Therefore, Pr(N mod 2^(k + 1) = 2^k) = 2^-(k + 1).
+    //
+    // Corollary 2:
+    //   Pr(h(N) = v) = Pr(3*LSB(N) = v)
+    //    = { Pr(LSB(N) = 2^k) = 2^-(k + 1) if v = 3*2^k for some integer k >= 0,
+    //        0 otherwise }.
 
     // i.e., node will survive until being pruned in 3*LSB(node) iterations.
     return node + 3*(node & -node);
