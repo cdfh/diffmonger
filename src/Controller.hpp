@@ -31,20 +31,12 @@ struct SnapshotDoesNotExist : std::runtime_error
     using std::runtime_error::runtime_error;
 };
 
-struct PruneDatasetParams
-{
-    std::optional<Node> node;
-};
-
 struct PruneParams
 {
-    std::optional<Node> node;
 };
 
 struct SnapshotParams
 {
-    bool prune_dataset = true;
-    bool prune_repository = true;
 };
 
 struct SnapshotImportParams
@@ -55,7 +47,7 @@ struct SnapshotImportParams
 struct RestoreParams
 {
     std::shared_ptr<PasswordBuffer> password;
-    std::optional<Node> node;
+    Node node;
     /**
      * Should nodes whose snapshots already exist in the live dataset be skipped?
      */
@@ -109,11 +101,6 @@ void restore(RepositoryStructure &repositoryStructure,
              RepositoryParams const &repositoryParams,
              BackendDriver &backendDriver,
              RestoreParams const &params);
-
-void prune_dataset(RepositoryStructure &repositoryStructure,
-                   RepositoryParams const &params,
-                   BackendDriver &backendDriver,
-                   PruneDatasetParams const &pruneParams);
 
 void prune_repository(RepositoryStructure &repositoryStructure,
                       RepositoryParams const &params,

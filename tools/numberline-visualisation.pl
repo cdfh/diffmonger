@@ -51,6 +51,9 @@ print <<'EOF';
 \documentclass[tikz,border=5pt]{standalone}
 \usepackage{tikz}
 
+\usepackage{xcolor}
+\pagecolor{white}
+
 \begin{document}
 \begin{tikzpicture}
 EOF

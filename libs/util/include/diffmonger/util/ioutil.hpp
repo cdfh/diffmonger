@@ -103,53 +103,11 @@ void writefile(std::filesystem::path const &path,
 template <typename T, typename ...Params>
 void writefile(std::filesystem::path const &path,
                std::vector<T> const &bytes,
+               int mode,
                Params &&...params)
 {
-    writefile(path, std::as_bytes(std::span(bytes)), std::forward<Params>(params)...);
+    writefile(path, std::as_bytes(std::span(bytes)), mode, std::forward<Params>(params)...);
 }
-
-#if 0
-struct Buffered
-{
-    std::vector<std::byte> buffer;
-    std::vector<std::byte>::iterator data_begin;
-    std::vector<std::byte>::iterator data_end;
-
-    Buffered(size_t bufsize)
-    {
-        buffer.resize(bufsize);
-    }
-
-    void readBytesExact(FdOwner const &fd,
-                        std::span<std::byte> out,
-                        std::string_view what = "Unexpected EOF")
-    {
-        size_t nout = 0;
-        bool eof = false;
-
-        while (!eof && (nout != out.size()))
-        {
-            if (data_begin == data_end)
-            {
-                data_begin = buffer.begin();
-                data_end = data_begin + readBytes(fd, buffer);
-
-                eof = (data_end - data_begin) != buffer.size();
-            }
-
-            size_t const n = std::min(size_t(data_end - data_begin),
-                                      out.size() - nout);
-            memcpy(out.data() + nout, &*data_begin, n);
-            data_begin+= n;
-            nout += n;
-        }
-
-        if (nout != out.size())
-            throw std::runtime_error(std::string(what));
-    }
-
-};
-#endif
 
 }}
 

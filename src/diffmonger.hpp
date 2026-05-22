@@ -3,8 +3,9 @@
 
 #include <cstdint>
 #include <cassert>
+#include <stdexcept>
 
-namespace diffmonger {
+namespace diffmonger::tree {
 
 /**
  * Calls the functor on the nodes of the Fenwick path from, but not including,
@@ -125,8 +126,11 @@ void alive_after(uint64_t const node, F &&falive)
         assert(node >= cur);
         if ((node - cur) >= ((uint_2powm >> 1) + (uint_2powm >> 2)))
         {
+            // Note: no need to check for arithmetic overflow;
+            // it's a basic invariant that candidate <= node.
             uint64_t const candidate = cur + (uint_2powm >> 2);
             // candidate = q*2^m + 2^(m - 2) = (4q + 1)*2^(m - 2)
+            assert(candidate <= node);
             if (candidate != cur)
                 falive(candidate);
         }
@@ -168,6 +172,9 @@ void alive_after(uint64_t const node, F &&falive)
         // eventually visit the current fenwick_parent().
         cur = (cur - 1)&~(uint_2powm - 1);
 
+        if (uint_2powm == (uint64_t(1) << 63))
+            throw std::runtime_error("Node too big");
+
         uint_2powm <<= 1;
     }
 }
@@ -177,9 +184,15 @@ void alive_after(uint64_t const node, F &&falive)
  * That is, the given node shall exist in alive_after(node - 1, ...),
  * but shall not exist in alive_after(node, ...).
  * Further, prune(node, ...) shall include time_of_demise(node).
+ *
+ * Note that node 0 is a special case and time_of_demise(0) is undefined.
+ * Mathematically, this should be interpreted as LSB(0) being undefined.
  */
 inline uint64_t time_of_demise(uint64_t const node)
 {
+    if (node == 0)
+        throw std::invalid_argument("time_of_demise(0) is undefined");
+
     // Note:
     // Let node = (2q + 1)*2^(m - 1).
     // Then T(node) = time_of_demise(node) = node + 3*LSB(node)
@@ -231,17 +244,64 @@ inline uint64_t time_of_demise(uint64_t const node)
 // (max_nalive was 52).
 
 /**
- * Calls the given functor on each node that should be deleted just after the creation
- * of the given node.
+ * Calls the given functor on each node, in order from greatest first,
+ * that should be deleted just after the creation of the given node.
+ * None of the deleted nodes shall be present in the fenwick_path() of the given node,
+ * and so it is also safe for the nodes to be pruned just before computing the snapshot
+ * for the given node (see comments for proof).
  */
 template <typename F>
 void prune(uint64_t const node, F &&fdelete)
 {
-    // One way of interpreting this logic is that it is a solver for the equation
+    // This function enumerates all solutions of j for the equation
     //   node = j + 3*LSB(j).
+    //
+    // While the documentation describes the function as though the nodes should
+    // be deleted /after/ the given node's creation,
+    // the diffmonger implementation actually applies it just /before/.
+    // This is safe: the pruned nodes will never exist in the fenwick_path of
+    // the given node. That is, given
+    //   node = j + 3*LSB(j)
+    // for some node j that will be pruned, there does not exist a k such that
+    //   j = P_k(node),
+    // where
+    //   P_0(node) = node
+    //   P_k(node) = P_{k - 1}(node - LSB(node))
+    //             = node - LSB_1(node) - LSB_2(node) ... - LSB_k(node),
+    // and LSB_i(node) is the i-th least significant bit of node.
+    //
+    // Proof:
+    // The proof is by contradiction:
+    //   P_k(node) = j
+    //   node - LSB_1(node) ... - LSB_k(node) = node - 3*LSB(j)
+    //   LSB_1(node) + ... + LSB_k(node) = 3*LSB(j)
+    // Since LSB_1(node) through LSB_k(node) are distinct bits,
+    // their sum has exactly k bits set. The rhs has exactly two bits set
+    // (LSB(j) and 2*LSB(j)) and therefore, equality can
+    // only hold if k = 2, in which case the above reduces to
+    //   LSB_1(node) + LSB_2(node) = 3*LSB(j).
+    // This is true if and only if
+    //   node = 3*LSB(j) + 4*LSB(j)*q,
+    // for some integer q >= 0. However, by the opening definition,
+    //   node = j + 3*LSB(j).
+    // Thus,
+    //   j = 4*LSB(j)*q.
+    // If q = 0, then j = 0 and by definition of LSB (see time_of_demise()),
+    // LSB(0) is undefined (node 0 is never pruned).
+    // If q != 0, then q >= 1, and so
+    //   LSB(j) = LSB(4*LSB(j)*q).
+    // Let LSB(j) = 2^m for some m. Then
+    //   LSB(j) = 2^m = LSB(4*2^m*q) = LSB(4)*LSB(2^m)*LSB(q) = 4*2^m*LSB(q)
+    //          = 2^(m + 2)*LSB(q),
+    // but this is a contradiction as 2^m != 2^(m + 2)*LSB(q)
+    // due to LSB(q) >= 1.
+
 
     for (uint64_t mask = 1; node&(~mask); mask |= mask << 1)
     {   // node > mask
+
+        if (mask == ((uint64_t(1) << 63) - 1))
+            throw std::runtime_error("Node too big");
 
         // Break if LSB(node) <= mask.
         if (node&mask)
@@ -251,7 +311,7 @@ void prune(uint64_t const node, F &&fdelete)
 
         // Note: mask != 0
         uint64_t const k = mask + (mask>>1) + 2; // = mask + 1 + ((mask + 1) >> 1);
-                                               // = MSB(mask) | (MSB(mask) << 1)
+                                                 // = MSB(mask) | (MSB(mask) << 1)
 
         // node:     xxxxx10000...0000
         // k from:   00000000000000011

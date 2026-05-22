@@ -13,8 +13,6 @@
 
 #include <array>
 #include <cstring>
-#include <type_traits>
-#include <span>
 #include <vector>
 #include <cassert>
 
@@ -66,48 +64,6 @@ KeyPair::Nonce KeyPair::Nonce::create()
     randombytes_buf(out.value.data(), out.value.size());
     return out;
 }
-
-#if 0
-KeyPair KeyPair::deserialise(std::span<std::byte const> const serialised)
-{
-    std::remove_cv_t<decltype(version)> version;
-    EncryptionKey::Salt salt;
-    Nonce nonce;
-    KdfParams kdfParams;
-    PubKey pubKey;
-    PrivKeyRepresentation privKeyRepresentation;
-
-    Deserialiser{serialised}
-        .deserialise(version)
-        .deserialise(salt.value)
-        .deserialise(nonce.value)
-        .deserialise(kdfParams.opslimit)
-        .deserialise(kdfParams.memlimit)
-        .deserialise(kdfParams.passwordHashAlgorithm)
-        .deserialise(pubKey.payload)
-        .deserialise(privKeyRepresentation.payload);
-
-    if (version != diffmonger::version)
-        throw std::runtime_error("Version mismatch");
-
-    return KeyPair{salt, nonce, kdfParams, pubKey, privKeyRepresentation, version};
-}
-
-std::vector<std::byte> KeyPair::serialise() const
-{
-    std::vector<std::byte> out;
-    Serialiser(out)
-        .serialise(version.serialised())
-        .serialise(salt.value)
-        .serialise(nonce.value)
-        .serialise(kdfParams.opslimit)
-        .serialise(kdfParams.memlimit)
-        .serialise(kdfParams.passwordHashAlgorithm)
-        .serialise(pubKey.payload)
-        .serialise(privKeyRepresentation.payload);
-    return out;
-}
-#endif
 
 
 std::vector<std::byte> KeyPair::serialise() const

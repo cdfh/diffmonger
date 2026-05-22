@@ -3,6 +3,8 @@
 #include <unordered_set>
 #include <cstdlib>
 #include <stdexcept>
+#include <array>
+#include <utility>
 
 using namespace diffmonger;
 
@@ -23,15 +25,6 @@ private:
     size_t result = 0;
 };
 
-bool was_pruned(Node const node, Node const doomed)
-{
-    size_t seen = false;
-    node.prune(
-        [&] (Node const victim)
-        { seen |= victim == doomed; });
-    return seen;
-}
-
 
 void run(size_t const n)
 {
@@ -45,8 +38,8 @@ void run(size_t const n)
                     std::string(str).append(": ").append(std::to_string(cur.value)));
         };
 
-    std::unordered_set<size_t> aliveset = { 0 };
-    aliveset.reserve(256);
+    std::unordered_set<uint64_t> aliveset = { 0 };
+    aliveset.reserve(512);
     size_t longdead_j = 0, veryalive_j = 0;
     Node const end{n + 1};
     for (cur = Node{1}; cur != end; cur = cur.next())
@@ -124,6 +117,8 @@ void run(size_t const n)
                         "Set does not contain parent");
         }
 
+        // Checks alive_after() calls functor with monotonically decreasing values
+        // and checks the gap width invariant.
         {
             Node prev = cur; // <-- Monotonically decreases.
             cur.alive_after(
@@ -141,6 +136,31 @@ void run(size_t const n)
                     fassert((alive.value < prev.value), "alive < prev");
                     fassert(2*unreachable_gap_width <= d, "gap width");
                     prev = alive;
+                });
+        }
+
+        {
+            std::array<Node, 256> fenwick_path;
+            auto end = fenwick_path.begin();
+            cur.fenwick_path_inc_root(
+                [&] (Node const node)
+                {
+                    fassert(end != fenwick_path.end(), "fenwick path too big");
+                    *end++ = node;
+                });
+
+            fassert(end != fenwick_path.begin(), "fenwick path non-empty");
+            Node prev = cur;
+            auto it = end;
+            cur.prune(
+                [&] (Node const node)
+                {
+                    fassert(node < std::exchange(prev, node),
+                            "prune() monotonically decreasing");
+                    while (--it != fenwick_path.begin())
+                        if (*std::prev(it) < node)
+                            break;
+                    fassert(*it != node, "prune() removed from fenwick path");
                 });
         }
     }

@@ -12,6 +12,7 @@
 #include <vector>
 #include <cassert>
 #include <stdexcept>
+#include <chrono>
 
 namespace diffmonger::serialisation
 {
@@ -270,6 +271,23 @@ struct Codec<std::span<T>>
     {
         static_assert(sizeof(T) == 0,
             "Deserialising std::span is not supported (no ownership)");
+    }
+};
+
+
+template <typename Clock, typename Duration>
+struct Codec<std::chrono::time_point<Clock, Duration>>
+{
+    static void serialise(Serialiser &s, std::chrono::time_point<Clock, Duration> const x)
+    {
+        s.serialise(x.time_since_epoch().count());
+    }
+
+    static auto deserialise(Deserialiser &s)
+    {
+        typename Duration::rep count;
+        s.deserialise(count);
+        return std::chrono::time_point<Clock, Duration>{Duration{count}};
     }
 };
 

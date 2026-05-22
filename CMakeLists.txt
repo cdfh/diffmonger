@@ -46,6 +46,8 @@ add_library(libdiffmonger STATIC
   src/RepositoryStructure.hpp
   src/sysutil.cpp
   src/sysutil.hpp
+  src/Trust.cpp
+  src/Trust.hpp
   src/zfs.cpp
   src/ZfsDriver.cpp
   src/ZfsDriver.hpp

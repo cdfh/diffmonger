@@ -5,18 +5,33 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <optional>
 #include <cassert>
+#include <limits>
+#include <optional>
+#include <stdexcept>
 
 namespace diffmonger {
 
-struct Node {
-    uint64_t value;
+struct Node
+{
+    using value_t = uint64_t;
+    value_t value;
 
     auto operator<=>(Node const &) const = default;
-    Node operator+(size_t inc) const { return { value + inc }; }
+    //Node operator+(int64_t offset) const { return { value + offset }; }
+    Node advance(value_t const n) const
+    {
+        if (n > std::numeric_limits<value_t>::max() - value)
+            throw std::runtime_error("Node too big");
+        return { value + n };
+    }
 
-    Node next() const { return { value + 1 }; }
+    Node next() const
+    {
+        if (value == std::numeric_limits<decltype(value)>::max())
+            throw std::runtime_error("Node too big");
+        return { value + 1 };
+    }
 
     /**
      * Calls the functor on the nodes of the Fenwick path from, but not including,
@@ -25,7 +40,7 @@ struct Node {
     template <typename F>
     void fenwick_path_exc_root_exc_root(F &&f) const
     {
-        diffmonger::fenwick_path_exc_root(
+        tree::fenwick_path_exc_root(
             value,
             [&f] (size_t const node) { f(Node{node}); });
     }
@@ -33,14 +48,14 @@ struct Node {
     template <typename F>
     void fenwick_path_inc_root(F &&f) const
     {
-        diffmonger::fenwick_path_inc_root(
+        tree::fenwick_path_inc_root(
             value,
             [&f] (size_t const node) { f(Node{node}); });
     }
 
     [[nodiscard]] Node fenwick_parent() const
     {
-        return Node{diffmonger::fenwick_parent(value)};
+        return Node{tree::fenwick_parent(value)};
     }
 
     std::optional<Node> fenwick_maybe_parent() const
@@ -62,18 +77,18 @@ struct Node {
     template <typename F>
     void alive_after(F &&falive) const
     {
-        diffmonger::alive_after(value, [&falive] (size_t const node) { falive(Node{node}); });
+        tree::alive_after(value, [&falive] (size_t const node) { falive(Node{node}); });
     }
 
     Node time_of_demise() const
     {
-        return Node{diffmonger::time_of_demise(value)};
+        return Node{tree::time_of_demise(value)};
     }
 
     template <typename F>
     void prune(F &&fprune) const
     {
-        diffmonger::prune(value, [&fprune] (size_t const node) { fprune(Node{node}); });
+        tree::prune(value, [&fprune] (size_t const node) { fprune(Node{node}); });
     }
 
     /**

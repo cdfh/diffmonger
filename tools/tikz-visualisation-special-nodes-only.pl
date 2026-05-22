@@ -144,6 +144,9 @@ say <<'EOF';
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta}
 
+\usepackage{xcolor}
+\pagecolor{white}
+
 \begin{document}
 
 \begin{tikzpicture}[

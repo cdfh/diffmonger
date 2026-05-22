@@ -13,6 +13,18 @@
 // This reduces risk of sensitive data being copied by reading off the end of
 // buffers. Obviously, this isn't useful in the current application,
 // because diffmonger has no buffer overruns!
+//
+// TODO: A call to std::abort() elsewhere in the code will bypass the destructor
+// and risk leaving the password in memory. This is very low risk given that
+// the password won't be in swapspace (as we disallow it).
+// A mitigation would be to have a global list of
+// instances and override the terminate handler to delete said instances.
+// However, other ways the program could abort (e.g., segfault) still
+// bypass any such safety. Possibly a better mitigation is to encrypt
+// the password. While this provides zero theoretical security advantage,
+// it offers a practical advantage in substantially increasing the practical
+// difficulty of recoverying both the ciphertext and the key from memory.
+
 
 namespace diffmonger {
 

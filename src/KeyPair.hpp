@@ -29,27 +29,9 @@ class DecryptedKeyPair;
  */
 struct KdfParams
 {
-#if 0
-    struct OpsLimit { size_t value; };
-    struct MemLimit { size_t value; };
-    struct PasswordHashAlgorithm { int value; };
-
-    KdfParams(OpsLimit opslimit,
-              MemLimit memlimit,
-              PasswordHashAlgorithm passwordHashAlgorithm);
-
-    auto getOpsLimit() const { return opsLimit; }
-    auto getMemLimit() const { return memLimit; }
-    auto getPasswordHashAlgorithm() const { return passwordHashAlgorithm; }
-private:
-    OpsLimit opsLimit;
-    MemLimit memLimit;
-    PasswordHashAlgorithm passwordHashAlgorithm;
-#else
     size_t opslimit = crypto_pwhash_OPSLIMIT_SENSITIVE;
     size_t memlimit = crypto_pwhash_MEMLIMIT_SENSITIVE;
     int passwordHashAlgorithm = crypto_pwhash_ALG_ARGON2ID13;
-#endif
 };
 
 template <>

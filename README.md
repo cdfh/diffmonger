@@ -20,14 +20,6 @@ The depth of the tree,
 and thus the maximum length of any chain,
 grows logarithmically with the number of snapshots taken,
 precluding the need to break chains to prevent linear growth.
-<!--
-it organises snapshots into a tree whose depth grows logarithmically with the number
-of snapshots taken.
--->
-<!--
-Each node corresponds to a snapshot that is stored as a difference
-relative to its parent.
--->
 
 To limit overlap between stored differences,
 diffmonger applies a pruning strategy.
@@ -35,28 +27,9 @@ As new nodes are added,
 existing nodes are pruned so that the number retained is at most twice the tree's depth,
 with spacing between retained nodes increasing geometrically with distance from
 the most recent node.
-<!-- This results in a snapshot coverage that is geometrically distributed through history,
-so that there is always at least one retained snapshot within a factor of two
-of any historical distance into the past. -->
 This results in there always being at least one retained snapshot within a factor of two
 of any historical distance into the past.
 
-<!-- This results in dense preservation of recent snapshots,
-with older snapshots become progressively sparser but never entirely vanish. -->
-
-<!--
-Snapshots are selectively pruned, introducing gaps between retained snapshots
-that increase geometrically with distance from the most recent snapshot.
-This retention scheme keeps the repository small,
-so that the number of retained snapshots grows logarithmically
-with the number of snapshots taken,
-and skews retention granularity to favour more recent snapshots.
-
-
-while still maintaining increasingly sparse coverage back to the initial snapshot:
-traversing the retained snapshots from most recent to oldest yields gaps in coverage
-that grow geometrically with distance from the present.
--->
 
 ## Security
 
@@ -64,7 +37,6 @@ Diffmonger was designed to be resilient against the following threat model:
 
 - The repository may be intentionally shared with an untrusted remote server
   (see [Zero trust file storage](#zero-trust-file-storage)).
-<!--  - Mitigation: Repository data is encrypted, except for ZFS snapshot GUIDs. -->
 - The local system may become compromised by ransomware (or other malware or an attacker)
   and attempt to render remote mirrors
   of the repository useless,
@@ -72,36 +44,11 @@ Diffmonger was designed to be resilient against the following threat model:
   or by flooding the repository with malignant snapshots in hope of forcing the remote
   mirror into pruning valid snapshots
   (see [Resilience to ransomware](#resilience-to-ransomware)).
-<!-- - The local system may become compromised by ransomware and seek to
-  directly delete
-  remote copies of the repository (see [Resilience to ransomware](#resilience-to-ransomware)). -->
-<!--  - Mitigations: immutable repository files, zero-trust prune operations
-    (needing neither encryption passphrase nor access to the ZFS datasets),
-    snapshot generation schedule and associated snapshot throttling by the
-    remote server; see "Resilience to ransomware"
--->
 - The repository may be become available to malicious parties who
   attempt to brute force
   the passphrase in the distant future with currently unavailable technology
   (see [Resilience to brute force attacks](#resilience-to-brute-force-attacks)).
-<!--  - Mitigations:
-    - Invocation from the command line supports part of the passphrase
-      being read from a file descriptor, so that the total passphrase bit depth
-      can be made vast, enabling a "what you have" security model.
-    - A memory-hard key-derivation function is employed (Argon2id).
--->
 
-
-<!--
-Diffmonger is designed under a mutual zero-trust model:
-
-- The storage server is untrusted.
-- The local system may be compromised (e.g., by ransomware).
-- Long-term repository exposure is assumed.
-
-The system is therefore designed so that neither side is required to be trusted for
-correctness, integrity, or pruning safety.
--->
 
 ### Zero-trust file storage
 
@@ -153,19 +100,6 @@ so that while the malignant snapshots may have their timestamps forged to make t
 appear older, they can never succeed in appearing older than the most recent
 valid snapshot.
 
-<!--
-An infected client may attempt to trick the remote repository into pruning valid
-snapshots by flooding the repository with spurious snapshots.
-To protect against this, snapshots are timestamped and repositories can be configured
-with anticipated snapshot generation rates.
-Snapshots generated in excess of this rate are considered quarantined
-and will not affect pruning until they exit their
-quarantine period.
-The approach is robust against attempts to forge timestamps by the client
-by virtue of the remote repository files being immutable once created
-and by virtue of pruning of the remote repository being performed with respect
-to the remote repository's clock, which is outside the client's control.
--->
 
 ## Resilience to brute-force attacks
 
@@ -205,37 +139,6 @@ a security token.
 Therefore, use of a hardware security token is preferred if at all possible.
 
 
-<!--
-
-## Passphrase handling
-
-Diffmonger accepts reading binary data from a file descriptor
-that will be appended to the keyboard input passphrase prior to key derivation.
-This enables integration with a
-[security token](https://en.wikipedia.org/wiki/Security_token),
-enabling a "what you have" security model.
-If using an [HMAC](https://en.wikipedia.org/wiki/HMAC)
-as the secret data,
-then the repository's UUID can be used as the HMAC key.
-
-
-Even without an security token,
-robustness against brute force attacks in the future
-can be substantially achieved by storing a high-entropy secret in a local file,
-presumably also writing the same secret and writing the same secret
-a "what you have" security model can be approximated by
-storing a high-entropy secret in a local file
-
-
-The data from the file descriptor,
-which should have high entropy,
-can come from a physical
-or a local file.
-It is possible for users without access to a security token to implement a poor man's
-"what you have" encryption by storing a secret code
-
--->
-
 # Tree structure
 
 Diffmonger's tree structure and the invariants it satisfies
@@ -254,9 +157,6 @@ Thus, to reconstruct the snapshot associated with node 23,
 diffmonger applies the following chain of differences:
 0, 16, 20, 22, 23. The snapshots associated with the other nodes in the tree
 can be reconstructed in a similar way.
-
-<!-- Only the shaded nodes are alive---all other nodes have been pruned
-and their corresponding snapshots are no longer accessible. -->
 
 ![Figure 1: The tree after the insertion of 24 nodes. Only nodes 23,22,21,20,18,16,12,8, and 0 are alive.](./docs/tree-23-kept-nodes-only.svg)
 
@@ -328,42 +228,31 @@ it was possible to find a node only 79 snapshots prior to the target node.
 ## Mathematical details
 
 The tree's unusual structure arises from two functions,
-$$P(n) = n - \operatorname{LSB}(n),$$ and
-$$T(n) = n + 3\cdot\operatorname{LSB}(n),$$
+$$P(n) = n - \mathrm{LSB}(n),$$ and
+$$T(n) = n + 3\cdot\mathrm{LSB}(n),$$
 where $n \in \mathbb{Z}_{> 0}$ and
-$\operatorname{LSB}(n)$ is the value of the least significant set bit of $n$
-(i.e., so that if $n = \sum_{i \geq 0} \: c_i 2^i$, then $\operatorname{LSB}(n) = \min_{i \geq 0} \: c_i 2^i$).
-<!-- (i.e., in C notation with `n` being an unsigned integer, `LSB(n) == n & -n`). -->
-<!-- If $n \in \mathbb{Z}_{\geq 0}$ is a node in the tree, then $P(n)$ is its parent
-and $T(n)$ is the point at which it shall be pruned from the tree
-(i.e., so that after taking the $T(n)$-th snapshot, counting from 0, the $n$-th node shall no longer exist).
-These functions are defined as follows: -->
+$\mathrm{LSB}(n)$ is the value of the least significant set bit of $n$
+(i.e., so that if $n = \sum_{i \geq 0} \: c_i 2^i$, then $\mathrm{LSB}(n) = \min_{i \geq 0} \: c_i 2^i$).
 If $n$ is a non-root node in the tree, then $P(n)$ is its parent
 and $T(n)$ is the point at which it shall be pruned from the tree
 (i.e., so that after insertion of node $T(n)$, node $n$ shall no longer exist).
 It immediately follows that the set of nodes alive after the insertion of node $n$
 is given by
-$$A_n = \{ k \in \mathbb{Z} \: | \: k \geq n \wedge T(k) > n \}.$$
+$$A_n = \{ k \in \mathbb{Z} \: \mid \: k \geq n \wedge T(k) > n \}.$$
 
 These dynamics give rise to the following three invariants:
 
 1. After insertion of node $n$,
    a path exists from the inserted node to the root that is $O(\log n)$ in depth
    (lifetime invariant).
-   <!-- The path in the tree from the $n$-th snapshot to the initial snapshot is ${O(\log n)}$. -->
 1. The total number of stored snapshots in the diffmonger repository at the time of
    taking the $n$-th snapshot is ${O(\log n)}$ (repository size invariant).
 1. After insertion of node $n$,
    then for all $m \in \mathbb{Z}$, $0 < m \leq n$,
    there always exist at least one alive node in
-   $\left\{k \in \mathbb{Z} \: | \: n - m \; \leq \; k \; \leq \; n - \lfloor m/2 \rfloor\right\}$
+   $\{ k \in \mathbb{Z} \: \mid \: n - m \; \leq \; k \; \leq \; n - \lfloor m/2 \rfloor\}$
    (node distribution invariant).
 
-<!--
-Snapshot coverage remains geometrically distributed through history,
-so that there is always at least one retained snapshot within a factor of two
-of any historical distance into the past.
--->
 
 ## Efficiency analysis
 

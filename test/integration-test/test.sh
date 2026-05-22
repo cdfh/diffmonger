@@ -53,7 +53,7 @@ echo_passphrase() {
     [[ -n "$DIFFMONGER_PASSPHRASE" ]] && printf "%s" "$DIFFMONGER_PASSPHRASE" || :
 }
 
-latest_guid() {
+get_latest_guid() {
     zfs list -H -t snapshot -o guid "$1" | tail -n1
 }
 
@@ -89,7 +89,7 @@ inner_test() {
     # --------------------------
     # Pick a random alive node
     # --------------------------
-    stored_node="$( diffmonger alive node="$(( SNAPSHOT_COUNT - 1 ))" | shuf -n1 )"
+    stored_node="$( diffmonger alive-after node="$(( SNAPSHOT_COUNT - 1 ))" | shuf -n1 )"
     [[ -n "$stored_node" ]] || die "Failed to pick an alive node"
     stored_guid=""
 
@@ -101,6 +101,8 @@ inner_test() {
         zfs destroy -R "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" || :
     zfs create -u "$DIFFMONGER_DATASET/diffmonger-temporary-dataset"
 
+    initial_guid="$( get_latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )"
+
     # --------------------------
     # Snapshot creation
     # --------------------------
@@ -109,12 +111,18 @@ inner_test() {
                    "dataset=$DIFFMONGER_DATASET/diffmonger-temporary-dataset"
 
         if (( i == stored_node )); then
-            stored_guid="$( latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )"
+            stored_guid="$( get_latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )"
             [[ -n "$stored_guid" ]] || die "Failed to capture GUID at node $stored_node"
+
+            diff <( cd "$primary_repository/snapshots" ; find -maxdepth 1 -type d |
+                        perl -ne 'print "$1\n" if m#\./(\d+)$#' | sort -n ) \
+                 <( diffmonger alive-after node="$i" | sort -n ) || die "Snapshots dir differs from expectation"
         fi
     done
 
-    latest_snapshot="$( latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )"
+    latest_guid="$( get_latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )"
+
+    [[ "$initial_guid" = "$latest_guid" ]] && die "Did not store any snapshots!"
 
     zfs destroy -R "$DIFFMONGER_DATASET/diffmonger-temporary-dataset"
 
@@ -141,8 +149,9 @@ inner_test() {
         die "Snapshot dirs differ"
 
     diffmonger R="$primary_repository" prune-repository
-    diffmonger R="$secondary_repository" prune-dataset \
-               dataset="$DIFFMONGER_DATASET/diffmonger-temporary-dataset"
+    # TODO: Remove.
+    # diffmonger R="$secondary_repository" prune-dataset \
+    #            dataset="$DIFFMONGER_DATASET/diffmonger-temporary-dataset"
 
     rm -rf "$primary_repository"
     zfs destroy -R "$DIFFMONGER_DATASET/diffmonger-temporary-dataset"
@@ -153,8 +162,8 @@ inner_test() {
     echo_passphrase | diffmonger R="$secondary_repository" restore \
                                  dataset="$DIFFMONGER_DATASET/diffmonger-temporary-dataset"
 
-    [[ "$latest_snapshot" \
-           = "$( latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )" ]] \
+    [[ "$latest_guid" \
+           = "$( get_latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )" ]] \
         || die "latest snapshot differs"
 
     # --------------------------
@@ -166,7 +175,7 @@ inner_test() {
                                  dataset="$DIFFMONGER_DATASET/diffmonger-temporary-dataset" \
                                  node="$stored_node"
 
-    restored_guid="$( latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )"
+    restored_guid="$( get_latest_guid "$DIFFMONGER_DATASET/diffmonger-temporary-dataset" )"
 
     [[ "$restored_guid" = "$stored_guid" ]] \
         || die "node restore guid mismatch: expected $stored_guid got $restored_guid"

@@ -197,6 +197,9 @@ public:
     virtual void verify(SnapshotId const &snapshotId) const = 0;
     virtual bool exists(SnapshotId const &snapshotId) const = 0;
 
+    /**
+     * Removes the given snapshot.
+     */
     virtual void remove_snapshot(SnapshotId const &snapshotId) = 0;
     virtual void initial(SnapshotId const &snapshotId, FdOwner out) = 0;
     virtual void diff(SnapshotId const &fromSnapshotId,

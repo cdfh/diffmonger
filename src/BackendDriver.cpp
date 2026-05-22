@@ -10,7 +10,7 @@ std::vector<std::byte> BackendDriver::SnapshotId::Encoded::serialise() const
     serialisation::Serialiser{out}
         .serialise(std::span(bytes))
         .serialise(node.value)
-        .serialise(timestamp.time_since_epoch().count());
+        .serialise(timestamp);
     return out;
 }
 
@@ -20,14 +20,14 @@ BackendDriver::SnapshotId::Encoded::deserialise(std::span<std::byte const> const
 {
     std::vector<std::byte> encoded_bytes;
     Node node;
-    timestamp_t::rep dur;
+    timestamp_t timestamp;
 
     serialisation::Deserialiser{bytes}
         .deserialise(encoded_bytes)
         .deserialise(node.value)
-        .deserialise(dur);
+        .deserialise(timestamp);
 
-    return Encoded{std::move(encoded_bytes), node, timestamp_t{timestamp_t::duration{dur}}};
+    return Encoded{std::move(encoded_bytes), node, timestamp};
 }
 
 }

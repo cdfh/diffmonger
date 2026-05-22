@@ -17,6 +17,7 @@
 #include <functional>
 #include <charconv>
 #include <iostream>
+#include <variant>
 
 namespace diffmonger {
 
@@ -37,12 +38,63 @@ using RequiredBooleanParameter = parameter::ParameterHelper<Parameter::Required,
 
 struct DiffmongerNode
 {
-    Node process(size_t const x) const
+    struct RelativeNode
     {
-        return Node{ .value = x };
+        int64_t value;
+    };
+    struct LatestNode {};
+
+    struct ValueT
+    {
+        std::variant<Node, RelativeNode, LatestNode> value;
+
+        Node toNode(RepositoryStructure const &repositoryStructure) const
+        {
+            auto const f =
+                [&] <typename T> (T const x) -> Node
+                {
+                    if constexpr (std::is_same_v<T, RelativeNode>)
+                    {
+                        auto const maybe_snapshot =
+                        repositoryStructure.getNodeRelativeToLastTrusted(x.value);
+                        if (!maybe_snapshot)
+                            throw std::runtime_error("No such node");
+                        return maybe_snapshot->node;
+                    } else if constexpr (std::is_same_v<T, LatestNode>)
+                    {
+                        auto const next = repositoryStructure.getNextSnapshotNode();
+                        if (next == Node::initial_value())
+                            throw std::runtime_error("No such node: repository empty");
+                        else
+                            return Node{next.value - 1};
+                    } else
+                    {
+                        return x;
+                    }
+                };
+            return std::visit(f, value);
+        }
+    };
+
+    ValueT process(auto &&_x) const
+    {
+        std::string_view const x{_x};
+        if (x.compare("+max") == 0)
+            return { LatestNode{} };
+        else if (x.starts_with("-") || x.starts_with("+"))
+            return { RelativeNode{parameter::Integer<int64_t>{}.process(x)} };
+        else
+            return { Node{parameter::Integer<uint64_t>{}.process(x)} };
     }
 
-    auto describe() const { return "Diffmonger node identifier"; }
+    auto describe() const
+    {
+        return "Diffmonger node identifier matching the regular expression "
+            "/[+-](\\d+|max)/; an unprefixed integer denotes the node, "
+            "an integer prefixed with \"+\" or \"-\" denotes the node relative "
+            "to the most recent trusted node, and +max denotes the most recent "
+            "node, irrespective of whether trusted or not.";
+    }
 };
 
 struct FdOrFile
@@ -78,12 +130,10 @@ using OptionalFdOrFile = parameter::ParameterHelper<Parameter::Optional,
                                                     parameter::Scalar,
                                                     FdOrFile>;
 
-using OptionalNodeParameter = parameter::ParameterHelper<Parameter::Optional,
-                                                         Node,
-                                                         parameter::Scalar,
-                                                         parameter::Integer<int64_t>,
-                                                         parameter::NonNegative,
-                                                         DiffmongerNode>;
+using DefaultedNodeParameter = parameter::ParameterHelper<Parameter::Defaulted,
+                                                          DiffmongerNode::ValueT,
+                                                          parameter::Scalar,
+                                                          DiffmongerNode>;
 
 using OptionalExistingFileParameter = parameter::ParameterHelper<Parameter::Optional,
                                                                  std::filesystem::path,
@@ -431,16 +481,6 @@ struct Main : RootCommand
     {
         using DriverRequiringCommandHelper::DriverRequiringCommandHelper;
 
-        BooleanParameter &pruneDataset = emplaceParameter<BooleanParameter>(
-            Parameter::Defaulted{{"true"}},
-            "prune-dataset",
-            "If true, then old snapshot objects will be pruned from the live dataset.");
-
-        BooleanParameter &pruneRepository = emplaceParameter<BooleanParameter>(
-            Parameter::Defaulted{{"true"}},
-            "prune-repository",
-            "If true, then old snapshot files will be pruned from the repository.");
-
         BooleanParameter &fromExport = emplaceParameter<BooleanParameter>(
             Parameter::Defaulted{{"false"}},
             "from-export",
@@ -449,8 +489,6 @@ struct Main : RootCommand
         void execute() override
         {
             SnapshotParams const snapshotParams = {
-                .prune_dataset = pruneDataset.get(),
-                .prune_repository = pruneRepository.get()
             };
 
             snapshot(*repositoryStructure,
@@ -468,6 +506,8 @@ struct Main : RootCommand
 
     struct SnapshotImport final : DriverRequiringCommandHelper<SubCommand<Main>>
     {
+        static auto constexpr name = "snapshot-import";
+
         using DriverRequiringCommandHelper::DriverRequiringCommandHelper;
 
         BooleanParameter &createSnapshots =
@@ -498,14 +538,14 @@ struct Main : RootCommand
 
         PasswordParameter passwordParameter{*this};
 
-        OptionalNodeParameter &nodeParameter = emplaceParameter<OptionalNodeParameter>(
-            "node", "Which node to restore");
+        DefaultedNodeParameter &nodeParameter = emplaceParameter<DefaultedNodeParameter>(
+            Parameter::Defaulted{{"+max"}}, "node", "Which node to restore");
 
         void execute() override
         {
             RestoreParams restoreParams = {
                 .password = passwordParameter.maybeReadPassword(*repositoryParams),
-                .node = nodeParameter.get()
+                .node = nodeParameter.get().toNode(*repositoryStructure)
             };
 
             auto backendDriverFactory = createBackendDriverFactory();
@@ -534,7 +574,14 @@ struct Main : RootCommand
         SnapshotImportCommand &snapshotImportCommand =
             emplaceParameter<SnapshotImportCommand>(
                 "cmd",
-                std::string("Command to run to import snapshots."));
+                std::string("Command to run to import snapshots. This command must at some "
+                            "point (either directly or indirectly) call ")
+                .append(SnapshotImport::name)
+                .append(", which will communicate with the current command via stdout and "
+                        "stdin. The given command must thus not produce any output on stdout "
+                        "or read from stdin, and must appropriately allow ")
+                .append(SnapshotImport::name)
+                .append(" to inherit both."));
 
         PasswordParameter passwordParameter{*this};
 
@@ -559,37 +606,6 @@ struct Main : RootCommand
 
         std::string_view getSelfDocumentation() const override
         { return "Copies the source repository to the target repository."; }
-    };
-
-
-    struct PruneDataset final : DriverRequiringCommandHelper<SubCommand<Main>>
-    {
-        OptionalNodeParameter &nodeParameter =
-            emplaceParameter<OptionalNodeParameter>(
-                "node",
-                "Node to prune as-of. If not given, "
-                "then the most recent valid (non-quarantined) node is used.");
-
-        Main &getMain() override { return getParent(); }
-
-        void execute() override
-        {
-            PruneDatasetParams pruneDatasetParams {
-                .node = nodeParameter.get()
-            };
-
-            prune_dataset(*repositoryStructure,
-                          *repositoryParams,
-                          *createBackendDriverFactory()->create(),
-                          pruneDatasetParams);
-        }
-
-        std::string_view getSelfDocumentation() const override
-        {
-            return "Remove old snapshot objects from the live dataset.";
-        }
-
-        using DriverRequiringCommandHelper::DriverRequiringCommandHelper;
     };
 
 
@@ -633,19 +649,16 @@ struct Main : RootCommand
         using SubCommand::SubCommand;
     };
 
-    struct Alive final : SubCommand<Main>
+    struct AliveAfter final : SubCommand<Main>
     {
         using RequiredNode = parameter::ParameterHelper<Parameter::Required,
-                                                        Node,
+                                                        uint64_t,
                                                         parameter::Scalar,
-                                                        parameter::Integer<ssize_t>,
-                                                        parameter::NonNegative,
-                                                        DiffmongerNode>;
-        RequiredNode &n = emplaceParameter<RequiredNode>("node",
-                                                         "Node.");
+                                                        parameter::Integer<uint64_t>>;
+        RequiredNode &n = emplaceParameter<RequiredNode>("node", "Node.");
         void execute() override
         {
-            n.get().alive_after([] (Node const i) { printf("%zu\n", i.value); });
+            Node{n.get()}.alive_after([] (Node const i) { printf("%zu\n", i.value); });
         }
 
         std::string_view getSelfDocumentation() const override
@@ -681,13 +694,13 @@ struct Main : RootCommand
         : RootCommand(std::move(name)),
           init(emplaceInitCommand(*this, std::move(initModeVariant)))
     {
-        Command::emplaceSubCommand<Alive>(*this, "alive");
+        Command::emplaceSubCommand<AliveAfter>(*this, "alive-after");
         Command::emplaceSubCommand<ShowInit>(*this, "show-init");
         Command::emplaceSubCommand<InitKeyPair>(*this, "init-keypair");
         Command::emplaceSubCommand<Snapshot>(*this, "snapshot");
-        Command::emplaceSubCommand<SnapshotImport>(*this, "snapshot-import");
+        Command::emplaceSubCommand<SnapshotImport>(*this, SnapshotImport::name);
         Command::emplaceSubCommand<Restore>(*this, "restore");
-        Command::emplaceSubCommand<PruneDataset>(*this, "prune-dataset");
+        //Command::emplaceSubCommand<PruneDataset>(*this, "prune-dataset");
         Command::emplaceSubCommand<PruneRepository>(*this, "prune-repository");
         Command::emplaceSubCommand<ExportRepository>(*this, "export-repository");
         Command::emplaceSubCommand<Help>(*this, "help");

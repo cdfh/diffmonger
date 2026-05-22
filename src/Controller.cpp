@@ -1,11 +1,11 @@
 #include "Controller.hpp"
 #include "BackendDriver.hpp"
 #include "EncryptionUtil.hpp"
-#include "diffmonger.hpp"
 #include "RepositoryParams.hpp"
 #include "RepositoryStructure.hpp"
 #include "KeyPair.hpp"
 #include "sysutil.hpp"
+#include "Trust.hpp"
 
 #include <diffmonger/util/PidOwner.hpp>
 #include <diffmonger/util/misc.hpp>
@@ -16,9 +16,7 @@
 #include <functional>
 #include <vector>
 #include <set>
-#include <iterator>
 #include <iostream>
-#include <algorithm>
 #include <span>
 #include <tuple>
 #include <array>
@@ -33,103 +31,6 @@ namespace diffmonger {
 namespace {
 
 using Snapshot = BackendDriver::SnapshotId::Encoded;
-
-/**
- * Given a span of snapshots, sorted by \c Snapshot::node,
- * returns an iterator that points to the first spurious element of the span,
- * where a spurious element is an element that breaks the min-time-between-snapshots rule.
- */
-std::span<Snapshot const>::iterator apply_time_constraints(
-    std::span<Snapshot const> const snapshots,
-    BackendDriver::SnapshotId::timestamp_t::duration
-    const min_time_between_snapshots)
-{
-    auto const now = BackendDriver::SnapshotId::timestamp_t::clock::now();
-
-    auto it = snapshots.begin();
-    auto end = snapshots.end();
-
-    if (it == end)
-        return it;
-
-    auto effective_timestamp = it->timestamp;
-    auto quarantine_begins_it = std::next(it);
-
-    for (++it; it != end; ++it)
-    {
-        // Removing this early exit would not affect correctness.
-        if (effective_timestamp > now)
-            return quarantine_begins_it;
-
-        if (it->timestamp < std::prev(it)->timestamp)
-            // Danger: the current timestamp is _earlier_ than the previous;
-            // without care, this would circumvent the protections we seek to add.
-            // Once the current node becomes matures out of quarantine,
-            // the previous node(s) will at some point get garbage collected,
-            // at which point we will no longer be able to tell that the current node
-            // lied about its timestamp.
-            // Thus, we need to extend the quarantine
-            // period for long enough that such a history re-write is not dangerous.
-            // To do this, we add a penalty equal to the duration that was lied about.
-            effective_timestamp += std::prev(it)->timestamp - it->timestamp;
-        else
-        {
-            // Timestamps from the future are not a threat and are falsely
-            // penalising themselves. They are likely due to mismatching clocks.
-            // To avoid needless cumulation of debt for such non-threats,
-            // cap the time to now.
-            auto const timestamp = std::min(it->timestamp, now);
-            auto const minimum = effective_timestamp + min_time_between_snapshots;
-
-            if (timestamp < minimum)
-                effective_timestamp = minimum;
-            else
-            {
-                effective_timestamp = timestamp;
-
-                if (effective_timestamp <= now)
-                {
-                    // std::prev(it) is safe. It's in the past and it didn't affect
-                    // the current effective_timestamp value. Remove it from quarantine.
-                    quarantine_begins_it = it;
-                }
-            }
-        }
-    }
-
-    if (effective_timestamp <= now)
-        quarantine_begins_it = end;
-
-    return quarantine_begins_it;
-}
-
-std::pair<std::span<Snapshot const>, std::span<Snapshot const>> apply_time_constraints2(
-    std::span<Snapshot const> const snapshots,
-    BackendDriver::SnapshotId::timestamp_t::duration
-    const min_time_between_snapshots)
-{
-    auto const it = apply_time_constraints(snapshots, min_time_between_snapshots);
-    return std::make_pair(std::span(snapshots.begin(), it), std::span(it, snapshots.end()));
-}
-
-/**
- * Read snapshots from the repository, but do not apply time constraints
- * (see apply_time_constraints()).
- * Snapshots are sorted by order of increasing node.
- */
-std::vector<Snapshot> readSnapshots(RepositoryStructure const &repositoryStructure)
-{
-    auto nodes = repositoryStructure.getNodes();
-
-    std::sort(nodes.begin(), nodes.end());
-
-    std::vector<Snapshot> out;
-
-    for (auto const &node: nodes)
-        out.push_back(repositoryStructure.getEncodedSnapshotId(node));
-
-    return out;
-}
 
 struct MissingNode : std::runtime_error
 {
@@ -149,7 +50,7 @@ void store_snapshot(RepositoryStructure &repositoryStructure,
 {
     Node const node = snapshotId.getNode();
 
-    auto temporarySnapshot = repositoryStructure.createTemporarySnapshot();
+    auto temporarySnapshot = repositoryStructure.checkOutTemporarySnapshot();
 
     auto const storeSnapshotOrDiff =
         [&] (FdOwner out)
@@ -219,48 +120,14 @@ nodeToSnapshotId(RepositoryStructure const &repositoryStructure,
 }
 
 template <typename F>
-void prune(RepositoryStructure const &repositoryStructure,
-           RepositoryParams const &repositoryParams,
-           std::optional<Node> node,
-           F const fremove)
+void prune(RepositoryStructure const &repositoryStructure, F const fremove)
 {
-    auto const all_snapshots = readSnapshots(repositoryStructure);
+    auto const maybe_node = repositoryStructure.getLatestTrustedNode();
 
-    auto const dopruning =
-        [&] (Node const node, std::span<Snapshot const> const snapshots)
-        {
-            if (snapshots.empty())
-                return;
+    if (!maybe_node)
+        return;
 
-            if (node > snapshots.back().node)
-                throw std::runtime_error("Requested to prune with respect to a node that is "
-                                         "more recent than any stored snapshots!");
-
-            std::set<Node> aliveset;
-            node.alive_after([&aliveset] (Node const node) { aliveset.emplace(node); });
-
-            for (auto const &snapshot: snapshots)
-                if (!aliveset.contains(snapshot.node) && (snapshot.node <= node))
-                    fremove(snapshot.node);
-        };
-
-    if (node.has_value())
-        dopruning(node.value(), all_snapshots);
-    else
-    {
-        using timestamp_t = BackendDriver::SnapshotId::timestamp_t;
-        auto const valid_snapshots =
-            apply_time_constraints2(
-                all_snapshots,
-                std::chrono::duration_cast<timestamp_t::duration>(
-                    std::chrono::seconds{
-                        repositoryParams.min_seconds_between_snapshots})).second;
-
-        if (valid_snapshots.empty())
-            return;
-
-        dopruning(valid_snapshots.back().node, valid_snapshots);
-    }
+    maybe_node->prune([&] (Node const node) { fremove(node); });
 }
 
 std::unique_ptr<DecryptedKeyPair>
@@ -268,8 +135,9 @@ decryptKeyPair(RepositoryStructure const &repositoryStructure,
                PasswordBuffer const &password)
 {
     std::unique_ptr<DecryptedKeyPair> out;
+    size_t slot = 0;
     repositoryStructure.withKeyPairs(
-        [&] (KeyPair const &keyPair, size_t const curslot)
+        [&] (KeyPair const &keyPair)
         {
             try
             {
@@ -280,8 +148,10 @@ decryptKeyPair(RepositoryStructure const &repositoryStructure,
                 // in either case, the correct course of action is to continue to try
                 // other slots.
                 std::cerr <<
-                    "When decrypting slot " << curslot << ": " << e.what() << "\n";
+                    "When decrypting slot " << slot << ": " << e.what() << "\n";
             }
+            ++slot;
+
             return true;
         });
     return out;
@@ -297,6 +167,7 @@ void init_repository(std::filesystem::path const &repository_path,
         RepositoryStructure::createRepository(repository_path, repositoryStructureFormatUuid, initargs);
 }
 
+// TODO: Need to check whether exceeding maxKeySlots.
 void init_keypair(std::filesystem::path const &repositoryPath,
                   InitKeyPairParams const &initKeyPairParams)
 {
@@ -318,18 +189,42 @@ namespace {
 bool _snapshot(RepositoryStructure &repositoryStructure,
                RepositoryParams const &repositoryParams,
                BackendDriver &backendDriver,
-               SnapshotParams const &params)
+               SnapshotParams const &)
 {
     // Regarding not checking for snapshots that exceed the min_seconds_between_snapshots
     // rule:
     //   This function only adds snapshots, it does not itself prune snapshots.
     //   Adding snapshots is safe, so no need to consider invalids when adding snapshots.
-    //   While this function does call prune_filesystem() and prune_repository(),
-    //   those commands do their own checks.
 
-    Node const node = repositoryStructure.getLatestNode()
-        .transform([] (auto const node) { return node.next(); })
-        .value_or(Node{0});
+    Node const node = repositoryStructure.getNextSnapshotNode();
+
+    // Pruning.
+    // Pruning intentionally occurs before taking the snapshot.
+    // The comments in tree::prune() prove that the nodes that get pruned shall
+    // never be in the fenwick_path() of the given node, and thus,
+    // pruning can safely occur prior to storing the snapshot.
+    prune(repositoryStructure,
+          [&] (Node const node) // Node may have already been pruned; this is okay.
+          {
+              std::cout << "Pruning " << node.value << "\n";
+              try
+              {
+                  // Does not throw if non-existing.
+                  repositoryStructure.deleteNode(node);
+
+                  // Throws SnapshotDoesNotExist if non-existing.
+                  if (auto const maybeSnapshotId =
+                      repositoryStructure.tryGetEncodedSnapshotId(node))
+                      backendDriver.remove_snapshot(
+                          *backendDriver.snapshotId(*maybeSnapshotId));
+              }
+              // If the snapshot does not exist in the backend,
+              // then nodeToSnapshotId() will throw.
+              // However, we don't care if it doesn't exist, as we're trying to delete
+              // it anyway!
+              catch (BackendDriver::SnapshotDoesNotExist const &) {}
+          });
+
 
     auto const maybeParentSnapshotId =
         node.fenwick_maybe_parent()
@@ -359,17 +254,6 @@ bool _snapshot(RepositoryStructure &repositoryStructure,
         repositoryParams,
         backendDriver);
 
-    PruneDatasetParams const pruneDatasetParams { .node = node };
-    PruneParams const pruneParams { .node = node };
-
-    if (params.prune_dataset)
-        prune_dataset(repositoryStructure,
-                      repositoryParams,
-                      backendDriver,
-                      pruneDatasetParams);
-    if (params.prune_repository)
-        prune_repository(repositoryStructure, repositoryParams, pruneParams);
-
     return !already_old;
 }}
 
@@ -386,6 +270,8 @@ void snapshot(RepositoryStructure &repositoryStructure,
         printf("%s\n", "Snapshot was old");
 }
 
+
+// Counterpart to export_repository(). The two commands work together.
 void snapshot_import(RepositoryStructure &repositoryStructure,
                      RepositoryParams const &repositoryParams,
                      BackendDriver &backendDriver,
@@ -435,6 +321,8 @@ void snapshot_import(RepositoryStructure &repositoryStructure,
             })
         .value_or(nullptr);
 
+    // Note: no need to prune after calling store_snapshot():
+    // the exporting command will have only exported alive snapshots.
     store_snapshot(
         repositoryStructure,
         *snapshotId,
@@ -513,13 +401,7 @@ void restore(RepositoryStructure const &repositoryStructure,
 
     if (!restore_all_available_nodes)
     {
-        auto const node = params.node.or_else(
-            [&] { return repositoryStructure.getLatestNode(); });
-
-        if (node)
-            fenwick_path_inc_root(node->value,
-                                  [&] (size_t const node)
-                                  { nodes.emplace(node); });
+        params.node.fenwick_path_inc_root([&] (Node const node) { nodes.emplace(node); });
     } else
     {
         // Do not do the following:
@@ -535,13 +417,13 @@ void restore(RepositoryStructure const &repositoryStructure,
         // required_nodes_only.
 
         // readSnapshots(): output sorted by node.
-        for (auto const &snapshot: readSnapshots(repositoryStructure))
+        for (Node const node: repositoryStructure.getNodesIncludingUntrusted())
         {
-            if (params.node && (snapshot.node > *params.node))
+            if (node > params.node)
                 break;
-            if (nodes.contains(snapshot.node.fenwick_parent())
-                || (snapshot.node == Node::initial_value()))
-                nodes.emplace(snapshot.node);
+            if (nodes.contains(node.fenwick_parent())
+                || (node == Node::initial_value()))
+                nodes.emplace(node);
         }
     }
 
@@ -574,6 +456,7 @@ void restore(RepositoryStructure const &repositoryStructure,
     }
 }
 
+
 void restore(RepositoryStructure &repositoryStructure,
              RepositoryParams const &repositoryParams,
              BackendDriver &backendDriver,
@@ -582,43 +465,48 @@ void restore(RepositoryStructure &repositoryStructure,
     restore(repositoryStructure, repositoryParams, backendDriver, params, false);
 }
 
-// TODO: Add a dry-run option.
-void prune_dataset(RepositoryStructure &repositoryStructure,
-                   RepositoryParams const &repositoryParams,
-                   BackendDriver &backendDriver,
-                   PruneDatasetParams const &pruneDatasetParams)
-{
-    prune(repositoryStructure,
-          repositoryParams,
-          pruneDatasetParams.node,
-          [&] (Node const node)
-          {
-              try
-              {
-                  backendDriver.remove_snapshot(
-                      *nodeToSnapshotId(repositoryStructure, backendDriver, node));
-              }
-              // If the snapshot does not exist in the backend,
-              // then nodeToSnapshotId() will throw.
-              // However, we don't care if it doesn't exist, as we're trying to delete
-              // it anyway!
-              catch (BackendDriver::SnapshotDoesNotExist const &) {}
-          });
-}
 
 void prune_repository(RepositoryStructure &repositoryStructure,
                       RepositoryParams const &repositoryParams,
-                      PruneParams const &pruneParams)
+                      PruneParams const &)
 {
-    prune(repositoryStructure,
-          repositoryParams,
-          pruneParams.node,
-          [&] (Node const node)
-          {
-              std::cout << "Pruning " << node.value << "\n";
+    using timestamp_t = BackendDriver::SnapshotId::timestamp_t;
+    auto const now = timestamp_t::clock::now();
+    /*
+     * Note: the following loop does pruning,
+     * then calls RepositoryStructure::writeBreadcrumb().
+     * Tempting as it may be, writeBreadcrumb() must not be refactored out of the loop
+     * (i.e., so as to be called only once upon the loop's completion).
+     * This is because the repository invariants must be maintained on the filesystem
+     * so that, if at any point the process is spontaneously terminated,
+     * the repository on-filesystem is in a valid state.
+     */
+    while (1)
+    {
+        auto const &breadcrumb = repositoryStructure.getBreadcrumb();
+        auto const maybe_snapshot =
+            repositoryStructure.tryGetEncodedSnapshotId(breadcrumb.untrusted_begin);
 
-              repositoryStructure.deleteNode(node);
-          });
+        if (!maybe_snapshot)
+            break;
+
+        auto const maybe_updated_breadcrumb =
+            trust::maybeUpdateBreadcrumb(
+                repositoryStructure,
+                breadcrumb,
+                *maybe_snapshot,
+                std::chrono::duration_cast<timestamp_t::duration>(
+                    std::chrono::seconds{repositoryParams.min_seconds_between_snapshots}),
+                now);
+        if (!maybe_updated_breadcrumb)
+            break;
+        breadcrumb.untrusted_begin.prune(
+            [&] (Node const node)
+            {
+                repositoryStructure.deleteNode(node);
+            });
+        repositoryStructure.writeBreadcrumb(*maybe_updated_breadcrumb);
+    }
 }
 
 ExitStatus export_repository(RepositoryStructure &repositoryStructure,
@@ -626,9 +514,18 @@ ExitStatus export_repository(RepositoryStructure &repositoryStructure,
                              BackendDriver &backendDriver,
                              ExportParams const &exportParams)
 {
+    Node node;
+
+    if (Node const next = repositoryStructure.getNextSnapshotNode();
+        next == Node::initial_value())
+        // Nothing to do.
+        return ExitStatus::SUCCESS;
+    else
+        node = {next.value - 1};
+
     RestoreParams const restoreParams {
         .password = exportParams.password,
-        .node = std::nullopt,
+        .node = node,
         .skip_existing = false
     };
 
@@ -714,7 +611,7 @@ void list_nodes(RepositoryStructure const &repositoryStructure,
 {
     (void) repositoryParams;
 
-    auto const nodes = repositoryStructure.getNodes();
+    auto const nodes = repositoryStructure.getNodesIncludingUntrusted();
 
     for (const auto &node : nodes)
     {

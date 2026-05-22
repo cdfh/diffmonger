@@ -19,7 +19,6 @@ namespace diffmonger {
 
 class KeyPair;
 
-
 class RepositoryStructure
 {
 public:
@@ -27,34 +26,47 @@ public:
      * Hub for collecting state related to a snapshot prior to its permanent
      * inclusion in the repository as a diffmonger node.
      * Until an instance of this class is commited,
-     * it is considered ephemeral and can safely be discarded without risk of
-     * corrupting the repository or dataset. However, a side effect of the
-     * diffmonger snapshot command is that a snapshot is created in the underlying dataset,
+     * both the instance and the associated state are considered ephemeral and can
+     * safely be discarded without risk of corrupting the repository or dataset.
+     * This class exists to eliminate risk of interrupted commands corrupting the
+     * repository. The act of commiting an instance is performed atomically
+     * by renaming a single directory on the filesystem.
+     *
+     * Ideally, the process of populating a TemporarySnapshot would have no side-effects.
+     * However, one side effect is unavoidable:
+     * the diffmonger snapshot command creates a snapshot in the underlying dataset,
      * and so destruction of the corresponding TemporarySnapshot instance makes this
-     * snapshot unreachable, effectively orphaning it in the dataset.
-     * This is not a data correctness concern
-     * (creating snapshots in the dataset should never cause data correctness issues),
-     * but does create garbage in the dataset.
-     * In effort to mitigate accumulation of such garbage,
-     * the repository has a UUID associated with it and the BackendDriver is expected
+     * snapshot unreachable.
+     * This is not a data correctness concern, but would create garbage in the dataset
+     * if left un mitigated. Therefore, each diffmonger repository has an UUID
+     * associated with it and the BackendDriver is expected
      * to identify its snapshots deterministically on the basis of the node identifier
      * and the repository UUID. Therefore, if one attempt to take a diffmonger snapshot
      * leaves an orphaned snapshot in the underlying dataset,
-     * then the next attempt should detect the previously orphaned snapshot and
-     * re-incorporate it into the repository. The Controller implements the
+     * then the next attempt shall detect the previously orphaned snapshot
+     * (by virtue of knowing its name) and shall
+     * re-incorporate it into the repository. The naming scheme (and in particular,
+     * each repository having a UUID) guarantees that the adopted snapshot shall not
+     * be unrelated and just coincidentally named. The Controller implements this
      * orchestration logic.
      *
-     * Important: Only one TemporarySnapshot instance can exist for a given repository
-     * at a time. This uniqueness is sadly not checked.
+     * Important: Only one TemporarySnapshot instance can exist for a given
+     * RepositoryStructure at a time. This uniqueness in checked at runtime.
      *
      * The TemporarySnapshot has an associated directory in the repository.
      */
     class TemporarySnapshot
     {
         friend class RepositoryStructure;
+        struct Impl;
     public:
-        TemporarySnapshot(TemporarySnapshot &&);
-        TemporarySnapshot &operator=(TemporarySnapshot &&);
+        TemporarySnapshot(std::shared_ptr<Impl>);
+
+        TemporarySnapshot(TemporarySnapshot const &) noexcept = delete;
+        TemporarySnapshot &operator=(TemporarySnapshot const &) noexcept = delete;
+
+        TemporarySnapshot(TemporarySnapshot &&) noexcept = default;
+        TemporarySnapshot &operator=(TemporarySnapshot &&) noexcept = default;
 
         FdOwner &getFd();
 
@@ -70,53 +82,34 @@ public:
          * power loss, hence, the cleanup belongs in the constructor and not the destructor.
          */
         ~TemporarySnapshot();
-
-    protected:
-        TemporarySnapshot(std::filesystem::path const &repository);
-        void commit(std::filesystem::path const &rename_to,
-                    BackendDriver::SnapshotId::Encoded const &);
     private:
-        struct Impl;
-        std::unique_ptr<Impl> impl;
+        void commit(RepositoryStructure const &repositoryStructure,
+                    BackendDriver::SnapshotId::Encoded const &);
+        std::shared_ptr<Impl> impl;
     };
 
-#if 0
+
     /**
-     * Convenience class as initargs annoyingly needs to be converted
-     * to vector<string_view> for parser.
+     * Checks out the single TemporarySnapshot instance associated with this instance,
+     * or throws if it has already been checked out and not yet returned by
+     * commit().
      */
-    class InitArgsPair
-    {
-    public:
-        std::vector<std::string> const &getInitArgs();
-        Uuid repositoryStructureFormatUuid;
-        std::vector<std::string> const initargs;
-        std::vector<std::string_view> const initargs_stringview =
-            std::vector<std::string_view>(initargs.begin(), initargs.end());
+    TemporarySnapshot checkOutTemporarySnapshot();
 
-        std::span<std::string_view const> span_exc_front() const
-        {
-            return { std::next(initargs_stringview.begin()),
-                     initargs_stringview.end() };
-        }
-
-        std::string const &getName() const
-        {
-            return initargs.front();
-        }
-
-        InitArgsPair(Uuid const &repositoryStructureFormatUuid,
-                     std::vector<std::string> initargs)
-            : repositoryStructureFormatUuid{repositoryStructureFormatUuid},
-              initargs{
-                  initargs.empty()
-                  ? throw std::runtime_error("Initargs invalid; corrupted repository?")
-                  : initargs}
-
-        {}
-    };
-#endif
-
+    /**
+     * Commit the TemporarySnapshot into the repository.
+     * The final action of this is to rename the temporary directory associated with the
+     * TemporarySnapshot from its temporary name to its permament name.
+     * The only effects of this method are changes to the directory and its contents.
+     * If the code throws or otherwise does not complete the rename operation,
+     * then the temporary directory will be discarded by diffmonger next time a temporary
+     * directory is needed by the current repository.
+     * In this way, the current method is exception safe:
+     * while the temporary directory may be left in a partial state upon an
+     * exception being thrown, this partial state has no subsequent effect.
+     */
+    void commit(TemporarySnapshot temporarySnapshot,
+                BackendDriver::SnapshotId::Encoded const &);
 
     std::filesystem::path getPayloadFile(Node const node) const;
 
@@ -141,22 +134,7 @@ public:
      * DoS safe alternative to readKeyPairs().
      */
     void withKeyPairs(
-        std::function<bool(KeyPair const &, size_t)> const &f) const;
-
-    /**
-     * Commit the TemporarySnapshot into the repository.
-     * The final action of this is to rename the temporary directory associated with the
-     * TemporarySnapshot from its temporary name to its permament name.
-     * The only effects of this method are changes to the directory and its contents.
-     * If the code throws or otherwise does not complete the rename operation,
-     * then the temporary directory will be discarded by diffmonger next time a temporary
-     * directory is needed by the current repository.
-     * In this way, the current method is exception safe:
-     * while the temporary directory may be left in a partial state upon an
-     * exception being thrown, this partial state has no subsequent effect.
-     */
-    void commit(TemporarySnapshot temporarySnapshot,
-                BackendDriver::SnapshotId::Encoded const &);
+        std::function<bool(KeyPair const &)> const &f) const;
 
     /**
      * Get the repository's initargs.
@@ -165,14 +143,88 @@ public:
     std::vector<std::string> const &getInitArgs() const;
     Uuid getRepositoryStructureFormatUuid() const;
 
-    std::vector<Node> getNodes() const;
-    std::optional<Node> getLatestNode() const;
+    std::optional<BackendDriver::SnapshotId::Encoded>
+    getNodeRelativeToLastTrusted(std::make_signed_t<Node::value_t> offset) const;
+
+    /**
+     * Get all nodes, including untrusted nodes, up to (not including)
+     * the given end node, if non-zero.
+     * If the given end node is zero, returns all nodes up to
+     * getNextsnapshotNode()
+     */
+    std::vector<Node> getNodesIncludingUntrusted(Node end = Node{0}) const;
+
+    /**
+     * State regarding the most recently trusted node.
+     * This state is needed for identifying the current node and for quarantining purposes.
+     * It is stored in a mutable file and updated whenever the repository
+     * is pruned (both when pruning was triggered directly by the prune-repository
+     * command, and when pruning was triggered indirectly by taking a snapshot).
+     * State that is written locally does not need to be mirrored to remote storage
+     * locations; instead, each time the remote storage locations run the prune-repository
+     * command, they discover new snapshots via fastForward() and then update their
+     * own local state files.
+     *
+     * Notes: storage of this state is unfortunately necessary under diffmonger's
+     * threat model, in particular, that an attacker can create arbitrary files in the
+     * repository directory. If the threat model did not include this,
+     * then a discovery algorithm could find the most recent node either in O(log(n)^2)
+     * (by successive queries for node existance on the nodes of the tree),
+     * or in O(log(n)) (by reading the snapshots dir).
+     * However, both algorithms are vulnerable to an attacker creating
+     * spurious snapshot files. The tree discovery method initially appears safe as it only
+     * relies upon querying nodes that are known to have once existed,
+     * and while a node exists,
+     * the threat model assumes that an attacker cannot mutate its state.
+     * However, it has a problem: once a node is pruned, the attacker is free to
+     * create a new malignant node under the old identifier, misleading the algorithm.
+     */
+    struct Breadcrumb
+    {
+        Node untrusted_begin;
+        /**
+         * Time at which the last trusted node became trusted.
+         */
+        BackendDriver::SnapshotId::timestamp_t last_trusted_node_authorised_at;
+    };
+    Breadcrumb const &getBreadcrumb() const;
+
+    /**
+     * Write the given breadcrumb to the repository.
+     * The following invariants must be true before the call:
+     *   - the repository must be fully pruned with respect to the new node that will
+     *     become trusted as a consequence of the call
+     *     (i.e., as though by getBreadcrumb().untrusted_begin.prune()).
+     */
+    void writeBreadcrumb(Breadcrumb const &breadcrumb);
+
+    /**
+     * Get the latest trusted node.
+     * The Controller must ensure that the repository always contains at least
+     * the tree::fenwick_path() from the returned node.
+     * Under normal circumstances, the repository shall also contain the full
+     * tree::alive_after() set. However, in some circumstances
+     * (in particular, if a previous attempt to take a snapshot failed after pruning
+     * but before taking the snapshot), only a subset of this set may be present,
+     * but this subset shall include at least the described tree::fenwick_path().
+     */
+    std::optional<Node> getLatestTrustedNode() const
+    {
+        auto const node = getBreadcrumb().untrusted_begin;
+        return node == Node::initial_value() ? std::nullopt : std::optional{node};
+    }
+
+    /**
+     * Returns the node of the next snapshot.
+     * Note that snapshots implicitly trust all nodes,
+     * and so this fast-forwards to the most recently taken node and then returns the
+     * next consecutive value.
+     */
+    Node getNextSnapshotNode() const;
 
     bool nodeExists(Node const node) const;
 
     FdOwner createPayloadFdForReading(Node node) const;
-
-    TemporarySnapshot createTemporarySnapshot();
 
     void deleteNode(Node node);
 
@@ -192,12 +244,22 @@ public:
     // but it's useful for printing debugging messages, etc.
     std::filesystem::path const &getRepository() const;
 
-    static void storeKeyPair(std::filesystem::path repository_path,
+    static void storeKeyPair(std::filesystem::path const &repository_path,
                              KeyPair const &keyPair);
 
     RepositoryStructure() = delete;
-    RepositoryStructure(RepositoryStructure const &);
+    RepositoryStructure(RepositoryStructure const &) = delete;
+    RepositoryStructure(RepositoryStructure &&) = default;
+
+    /**
+     * Constructor.
+     * Only a single RepositoryStructure instance should exist at any point in time
+     * for a given repository.
+     */
     RepositoryStructure(std::filesystem::path const &repository);
+
+    RepositoryStructure &operator=(RepositoryStructure const &) = delete;
+    RepositoryStructure &operator=(RepositoryStructure &&) = default;
 
     ~RepositoryStructure();
 
@@ -212,9 +274,20 @@ protected:
     template <typename F>
     void foreachNode(F &&f) const;
 private:
+    /**
+     * Lockfile fd, upon which a F_OFD_SETLK lock is obtain
+     * (locks for the duration of the fd being held).
+     * Every RepositoryStructure instance obtains a lock, including read-only operations.
+     * While there's no reason overlapping read-only operations couldn't be supported,
+     * it would increase code complexity for the sake of supporting an exceedingly rare
+     * use case.
+     */
+    FdOwner lockfd;
     std::filesystem::path repository;
     Uuid repositoryStructureFormatUuid;
     std::vector<std::string> initargs;
+    Breadcrumb breadcrumb;
+    std::shared_ptr<TemporarySnapshot::Impl> temporarySnapshotImpl;
 };
 
 }

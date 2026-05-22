@@ -13,10 +13,8 @@
 #include <vector>
 #include <memory>
 #include <cstdio>
-#include <utility>
 #include <algorithm>
 #include <sys/stat.h>
-#include <charconv>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -31,16 +29,23 @@ inline std::filesystem::path idFileName() { return "id"; }
 inline std::filesystem::path initArgsFileName() { return "initargs"; }
 inline std::filesystem::path keysDirName() { return "keys"; }
 inline std::filesystem::path userDataDirName() { return "user-data"; }
-#if 0
-inline std::filesystem::path repositoryVersionFileName() { return "repository-version"; }
-inline std::string_view repositoryVersion() { return "fb95347a-5159-4e50-8c63-8757a96550e4"; }
-#endif
+inline std::filesystem::path breadcrumbFileName() { return "breadcrumb"; }
+inline std::filesystem::path lockFileName() { return "lock"; }
 inline std::filesystem::path uuidFileName() { return "repository-uuid"; }
 
 static constexpr size_t maxKeySlots = 255;
 
 
-// Returns the number of keyFiles present.
+/*
+ * Iterates over each keypair.
+ * For simplicity, it is not possible to delete keypairs.
+ * If this functionality is deemed necessary in future, the best approach will be to
+ * empty the file without deleting it, or to overwrite the contents with a new keypair
+ * that is immediately forgotten. Recall that a well configured
+ * remote mirror will never reproduce
+ * modifications or deletions, so deleting a keypair will not prevent existing data
+ * from being decryptable with the keypair in question on the remote repository.
+ */
 template <typename F>
 void withKeyFiles(std::filesystem::path const &repository, F &&f)
 {
@@ -50,70 +55,34 @@ void withKeyFiles(std::filesystem::path const &repository, F &&f)
         throw std::runtime_error("Invalid keys directory for repository");
 
     /*
-     * The logic here is unexpected but intentional.
      * We cannot do a regular traversal of the directory because an attacker
      * may have made the directory infinitely populated in effort to hinder recovery.
-     * Thus, we iterate on a counter instead.
      */
-
-    size_t n = 0;
-    for (auto const &ignored: std::filesystem::directory_iterator(dir))
+    for (size_t i = 0; i != maxKeySlots; ++i)
     {
-        ++n;
-        (void) ignored;
-    }
-
-    size_t const counter_end = std::min(n, maxKeySlots + 1);
-    for (size_t counter = 0; counter != counter_end; ++counter)
-    {
-        auto const filename = dir/std::to_string(counter);
+        auto const filename = dir/std::to_string(i);
         if (std::filesystem::exists(filename))
         {
-            if (f(filename, counter))
+            if (f(filename))
                 return;
-        }
+        } else
+            return;
     }
-
-    if (n > maxKeySlots)
-        throw std::runtime_error("Too many keyslots");
 }
 
 
-std::vector<std::pair<std::filesystem::path, size_t>>
+std::vector<std::filesystem::path>
 getKeyFiles(std::filesystem::path const &repository)
 {
-    struct Entry
-    {
-        Entry(std::filesystem::path const &path) : path(path)
-        {
-            auto const &filename = this->path.filename();
-            auto const &str = filename.native();
-            if (std::from_chars(str.data(), str.data() + str.size(), n).ec != std::errc{})
-                throw std::runtime_error("Could not interpret filename as a key: " + str);
-        }
-        bool operator<(Entry const &other) const
-        {
-            return n < other.n;
-        }
-        std::filesystem::path path;
-        size_t n;
-    };
-
-    std::vector<Entry> entries;
+    std::vector<std::filesystem::path> out;
 
     withKeyFiles(
         repository,
-        [&] (std::filesystem::path const &path, size_t)
+        [&] (std::filesystem::path const &path)
         {
-            entries.push_back(path);
+            out.push_back(path);
             return false;
         });
-
-    std::sort(entries.begin(), entries.end());
-
-    std::vector<std::pair<std::filesystem::path, size_t>> out;
-    for (auto const &entry: entries)
-        out.emplace_back(entry.path, entry.n);
 
     return out;
 }
@@ -126,19 +95,18 @@ struct RepositoryStructure::TemporarySnapshot::Impl
     FdOwner fd;
     std::optional<BackendDriver::SnapshotId::Encoded> encoded;
 
-    Impl(std::filesystem::path const &repository)
-        : repository(repository)
+    Impl(RepositoryStructure const &repositoryStructure)
+        : repository(repositoryStructure.getRepository())
     {
         auto const path = getPath();
         auto const payloadFile = path/payloadFileName();
+
         if (std::filesystem::exists(path))
         {
             std::filesystem::remove(path/idFileName());
             std::filesystem::remove(payloadFile);
         } else
-        {
             std::filesystem::create_directories(path);
-        }
 
         fd = FdOwner::from_syscall(open(payloadFile.c_str(),
                                         O_CREAT|O_WRONLY|O_CLOEXEC|O_EXCL,
@@ -152,28 +120,26 @@ struct RepositoryStructure::TemporarySnapshot::Impl
     std::filesystem::path getPath() const { return repository/temporarySnapshotDirName(); }
 };
 
-RepositoryStructure::TemporarySnapshot::TemporarySnapshot(TemporarySnapshot &&) = default;
-RepositoryStructure::TemporarySnapshot &
-RepositoryStructure::TemporarySnapshot::operator=(
-    RepositoryStructure::TemporarySnapshot &&) = default;
-
-
 FdOwner &RepositoryStructure::TemporarySnapshot::getFd() { return impl->fd; }
 
 RepositoryStructure::TemporarySnapshot::TemporarySnapshot(
-    std::filesystem::path const &repository)
-    : impl(std::make_unique<Impl>(repository))
+    std::shared_ptr<Impl> impl)
+    : impl(std::move(impl))
 {
 }
 
+
 RepositoryStructure::TemporarySnapshot::~TemporarySnapshot()
 {
-};
+}
 
+// TODO: Should lock the breadcrumb file on filesystem.
 void RepositoryStructure::TemporarySnapshot::commit(
-    std::filesystem::path const &rename_to,
+    RepositoryStructure const &repositoryStructure,
     BackendDriver::SnapshotId::Encoded const &encoded)
 {
+    auto const rename_to = repositoryStructure.pathForNode(encoded.node);
+
     ioutil::writefile(impl->getIdFile(), encoded.serialise(), 0666);
 
     try
@@ -192,10 +158,41 @@ void RepositoryStructure::TemporarySnapshot::commit(
 }
 
 
+RepositoryStructure::TemporarySnapshot
+RepositoryStructure::checkOutTemporarySnapshot()
+{
+    if (temporarySnapshotImpl)
+        throw std::logic_error("TemporarySnapshot already checked out");
+    temporarySnapshotImpl = std::make_shared<TemporarySnapshot::Impl>(*this);
+    return TemporarySnapshot{temporarySnapshotImpl};
+}
+
+
+void RepositoryStructure::commit(TemporarySnapshot temporarySnapshot,
+                                 BackendDriver::SnapshotId::Encoded const &encoded)
+{
+    if (temporarySnapshotImpl != temporarySnapshot.impl)
+        throw std::invalid_argument("Invalid TemporarySnapshot: owner mismatch");
+    this->temporarySnapshotImpl.reset();
+
+    temporarySnapshot.commit(*this, encoded);
+
+    // Note: it is okay if the following never happens (e.g., due to unexpected interrupt,
+    // poweroff, etc). The Controller doesn't rely upon the breadcrumb for correctness,
+    // only for efficiency. If the breadcrumb is stale, the Controller will safely
+    // traverse until it reaches the end.
+    writeBreadcrumb(
+        Breadcrumb { .untrusted_begin = encoded.node.next(),
+                     .last_trusted_node_authorised_at = encoded.timestamp
+        });
+}
+
+
 std::filesystem::path RepositoryStructure::getPayloadFile(Node const node) const
 {
     return pathForNode(node) / payloadFileName();
 }
+
 
 std::expected<BackendDriver::SnapshotId::Encoded, std::system_error>
 RepositoryStructure::tryGetEncodedSnapshotId2(Node const node) const
@@ -238,17 +235,17 @@ RepositoryStructure::getEncodedSnapshotId(Node const node) const
 }
 
 void RepositoryStructure::withKeyPairs(
-    std::function<bool(KeyPair const &, size_t)> const &f) const
+    std::function<bool(KeyPair const &)> const &f) const
 {
     withKeyFiles(
         repository,
-        [&] (std::filesystem::path const &path, size_t const slot)
+        [&] (std::filesystem::path const &path)
         {
             auto const buf =
                 ioutil::read(FdOwner::from_syscall(open(path.c_str(), O_RDONLY),
                                                    "Could not open keyfile",
                                                    path.native()));
-            return f(serialisation::Deserialiser{buf}.deserialise<KeyPair>(), slot);
+            return f(serialisation::Deserialiser{buf}.deserialise<KeyPair>());
         });
 }
 
@@ -257,21 +254,13 @@ std::vector<std::unique_ptr<KeyPair>> RepositoryStructure::readKeyPairs() const
     std::vector<std::unique_ptr<KeyPair>> out;
 
     withKeyPairs(
-        [&] (KeyPair const &keyPair, size_t)
+        [&] (KeyPair const &keyPair)
         {
             out.emplace_back(std::make_unique<KeyPair>(keyPair));
             return false;
         });
 
     return out;
-}
-
-void RepositoryStructure::commit(TemporarySnapshot temporarySnapshot,
-                                 BackendDriver::SnapshotId::Encoded const &encoded)
-{
-    if (temporarySnapshot.impl->repository != repository)
-        throw std::logic_error("Invalid TemporarySnapshot: repository mismatch");
-    temporarySnapshot.commit(pathForNode(encoded.node), encoded);
 }
 
 // Function called in unspecified order.
@@ -306,27 +295,32 @@ Uuid RepositoryStructure::getRepositoryStructureFormatUuid() const
     return repositoryStructureFormatUuid;
 }
 
-std::vector<Node> RepositoryStructure::getNodes() const
+std::vector<Node> RepositoryStructure::getNodesIncludingUntrusted(Node const end) const
 {
-    std::vector<Node> nodes;
-    foreachNode([&nodes] (Node const node) { nodes.emplace_back(node); });
-    std::sort(nodes.begin(), nodes.end());
+    std::vector<Node> out;
 
-    return nodes;
-}
+    if (breadcrumb.untrusted_begin == Node::initial_value())
+        return {};
 
-std::optional<Node> RepositoryStructure::getLatestNode() const
-{
-    std::optional<Node> out;
+    Node{breadcrumb.untrusted_begin.value - 1}
+        .alive_after(
+            [&] (Node const node)
+            {
+                // It is valid for the repository to not have all alive nodes
+                // (so long as it has all nodes in the fenwick path).
+                // This can happen if poweroff occurred after pruning but before
+                // taking a snapshot.
+                if (nodeExists(node))
+                    out.push_back(node);
+            });
 
-    foreachNode(
-        [&] (Node const node)
-        {
-            if (out)
-                out = std::max(*out, node);
-            else
-                out = node;
-        });
+    [&] (Node const end)
+    {
+        for (auto node = breadcrumb.untrusted_begin; node != end; node = node.next())
+            out.push_back(node);
+    }(end == Node{0} ? getNextSnapshotNode() : std::min(end, getNextSnapshotNode()));
+
+    std::sort(out.begin(), out.end());
 
     return out;
 }
@@ -343,10 +337,6 @@ FdOwner RepositoryStructure::createPayloadFdForReading(Node const node) const
     return FdOwner::from_syscall(open(path.c_str(), O_RDONLY), "open", path.c_str());
 }
 
-RepositoryStructure::TemporarySnapshot RepositoryStructure::createTemporarySnapshot()
-{
-    return TemporarySnapshot{repository};
-}
 
 RepositoryStructure RepositoryStructure::createRepository(
     std::filesystem::path const &repository_path,
@@ -370,13 +360,6 @@ RepositoryStructure RepositoryStructure::createRepository(
                       S_IRUSR | S_IWUSR,
                       true);
 
-#if 0
-    ioutil::writefile(repository_path/repositoryVersionFileName(),
-                      std::as_bytes(std::span(repositoryVersion())),
-                      S_IRUSR | S_IWUSR,
-                      true);
-#endif
-
     {
         std::vector<std::byte> buffer;
         serialisation::Serialiser{buffer}
@@ -388,7 +371,7 @@ RepositoryStructure RepositoryStructure::createRepository(
                           true);
     }
 
-    return { repository_path };
+    return RepositoryStructure{repository_path};
 }
 
 void RepositoryStructure::deleteNode(Node const node)
@@ -405,14 +388,79 @@ Uuid RepositoryStructure::getRepositoryUuid() const
     return Uuid::deserialise(bytes);
 }
 
+
+std::optional<BackendDriver::SnapshotId::Encoded>
+RepositoryStructure::getNodeRelativeToLastTrusted(
+    std::make_signed_t<Node::value_t> const offset) const
+{
+    using signed_t = std::make_signed_t<Node::value_t>;
+    using signedlimits = std::numeric_limits<signed_t>;
+    // Taking into account that breadcrumb.untrusted_begin is +1 from the current node.
+    // Note: arithmetic must not overflow; offset is allowed to be signedlimits::max()
+    // and signedlimits::min().
+    auto const offset_prime = std::max(signedlimits::min() + 1,
+                                       offset) - 1;
+
+    if (offset_prime > 0)
+    {
+        auto next = tryGetEncodedSnapshotId(breadcrumb.untrusted_begin);
+        for (size_t i=0; next && (i != size_t(offset_prime)); ++i)
+            next = tryGetEncodedSnapshotId(next->node.next());
+        return next;
+    } else
+    {
+        if (breadcrumb.untrusted_begin.value > signedlimits::max())
+            throw std::runtime_error("Node too big");
+        // Important: do /not/ do -offset_prime <= breadcrumb.untrusted_begin.value:
+        // -offset_prime may overflow, whereas -breadcrumb.untrusted_begin.value
+        // shall not (due to above check).
+        if (offset_prime >= -static_cast<signed_t>(breadcrumb.untrusted_begin.value))
+            return tryGetEncodedSnapshotId(Node{breadcrumb.untrusted_begin.value + offset});
+        else
+            return std::nullopt;
+    }
+}
+
+
+RepositoryStructure::Breadcrumb const &RepositoryStructure::getBreadcrumb() const
+{
+    return breadcrumb;
+}
+
+void RepositoryStructure::writeBreadcrumb(Breadcrumb const &breadcrumb)
+{
+    std::vector<std::byte> bytes;
+
+    serialisation::Serialiser{bytes}
+        .serialise(breadcrumb.untrusted_begin.value)
+        .serialise(breadcrumb.last_trusted_node_authorised_at);
+
+    ioutil::writefile(repository/breadcrumbFileName(), bytes, 0666);
+
+    // Pointless copy to get compiler to warn on missing fields.
+    this->breadcrumb = Breadcrumb{breadcrumb.untrusted_begin,
+                                  breadcrumb.last_trusted_node_authorised_at};
+}
+
+Node RepositoryStructure::getNextSnapshotNode() const
+{
+    Node prev = breadcrumb.untrusted_begin;
+    while (true)
+        if (auto const next = tryGetEncodedSnapshotId(prev))
+            prev = next->node;
+        else
+            return prev;
+}
+
+
 std::filesystem::path const &RepositoryStructure::getRepository() const { return repository; }
 
-void RepositoryStructure::storeKeyPair(std::filesystem::path repository_path,
+void RepositoryStructure::storeKeyPair(std::filesystem::path const &repository_path,
                                        KeyPair const &keyPair)
 {
     auto const paths = getKeyFiles(repository_path);
 
-    size_t slot = paths.empty() ? 0 : paths.back().second + 1;
+    size_t const slot = paths.size();
 
     auto const path = repository_path/keysDirName()/std::to_string(slot);
 
@@ -424,37 +472,70 @@ void RepositoryStructure::storeKeyPair(std::filesystem::path repository_path,
 }
 
 
-// Copy constructor.
-RepositoryStructure::RepositoryStructure(RepositoryStructure const &other)
-    : RepositoryStructure(other.repository)
-{
-}
-
 RepositoryStructure::RepositoryStructure(std::filesystem::path const &repository)
-    : repository(repository)
+    : lockfd{
+            [&]
+            {
+                auto const lockpath = repository/lockFileName();
+                auto out =
+                    FdOwner::from_syscall(open(lockpath.c_str(),
+                                               O_CREAT | O_TRUNC | O_RDWR,
+                                               0666),
+                                          lockpath.c_str());
+                flock fl = {
+                    .l_type = F_WRLCK,
+                    .l_whence = SEEK_SET,
+                    .l_start = 0,
+                    .l_len = 0,
+                    .l_pid = 0 // Unused
+                };
+
+                while (true)
+                    // Blocks.
+                    if (int const r = fcntl(out.get(), F_OFD_SETLKW, &fl);
+                        r == 0)
+                        return out;
+                    else
+                    {
+                        if (errno != EINTR)
+                            throw std::system_error(errno, std::system_category(),
+                                                    "Failed to obtain lock");
+                    }
+                return out;
+            }()},
+      repository(repository)
 {
-#if 0
-    auto const thisRepositoryVersion =
-        ioutil::readfile(repository/repositoryVersionFileName());
-    if (!equal(std::as_bytes(std::span(thisRepositoryVersion)),
-               std::as_bytes(std::span(repositoryVersion()))))
-        throw std::runtime_error(
-            std::string("Unsuported diffmonger repository version: ")
-            .append(std::string_view(
-                        reinterpret_cast<char const *>(thisRepositoryVersion.data()),
-                        thisRepositoryVersion.size())));
-#endif
-    auto const data = ioutil::readfile(repository / initArgsFileName());
-    serialisation::Deserialiser{data}
-        .deserialise(repositoryStructureFormatUuid)
-        .deserialise(initargs);
+    {
+        auto const data = ioutil::readfile(repository / initArgsFileName());
+        serialisation::Deserialiser{data}
+            .deserialise(repositoryStructureFormatUuid)
+            .deserialise(initargs);
+    }
 
     if (initargs.empty())
         throw std::runtime_error("Repository initargs were non-valid (empty)");
+
+    {
+        if (auto const breadcrumbPath = repository/breadcrumbFileName();
+            std::filesystem::exists(breadcrumbPath))
+        {
+            auto const bytes = ioutil::readfile(breadcrumbPath);
+            serialisation::Deserialiser{bytes}
+                .deserialise(breadcrumb.untrusted_begin.value)
+                .deserialise(breadcrumb.last_trusted_node_authorised_at);
+            // Pointless copy to get compiler to warn on missing fields.
+            breadcrumb = Breadcrumb{breadcrumb.untrusted_begin,
+                                    breadcrumb.last_trusted_node_authorised_at};
+        } else
+        {
+            breadcrumb = Breadcrumb{Node{0},
+                                    BackendDriver::SnapshotId::timestamp_t::min()};
+        }
+    }
 }
 
-RepositoryStructure::~RepositoryStructure() {}
 
+RepositoryStructure::~RepositoryStructure() {}
 
 
 std::filesystem::path RepositoryStructure::pathForNode(Node const node) const

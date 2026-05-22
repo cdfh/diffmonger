@@ -21,7 +21,7 @@ FdPipePair FdPipePair::create(int const flags)
 }
 
 
-FdOwner from_syscall(int const fd, char const * const what)
+FdOwner FdOwner::from_syscall(int const fd, char const * const what)
 {
     if (fd == -1)
         throw std::system_error(errno,
